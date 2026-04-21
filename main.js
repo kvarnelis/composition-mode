@@ -6,6 +6,10 @@ const DEFAULT_SETTINGS = {
   paperSize: 'letter',
   defaultBackgroundFade: 0.35,
   defaultPaperWidth: 90,
+  maxPaperWidthPx: 1400,
+  imageWidthPct: 100,
+  pageMarginXIn: 1.25,
+  pageMarginYIn: 1.0,
   showPageBreaks: true,
   pageGapHeight: 60,
   pageWordCount: 400,
@@ -1424,13 +1428,14 @@ class CompositionModePlugin extends Plugin {
       body.composition-mode-active .workspace-leaf-content {
         width: ${this.paperWidth}% !important;
         min-width: min(160px, calc(100vw - 6rem)) !important;
-        max-width: calc(100vw - 6rem) !important;
+        max-width: min(calc(100vw - 6rem), ${Math.max(400, this.settings.maxPaperWidthPx || 1400)}px) !important;
         box-sizing: border-box !important;
         background: var(--background-primary) !important;
         zoom: ${visualZoom};
       }
       body.composition-mode-active .cm-editor {
-        --composition-mode-page-margin-x: 1.25in;
+        --composition-mode-page-margin-x: ${Math.max(0.25, Math.min(3, this.settings.pageMarginXIn ?? 1.25))}in;
+        --composition-mode-page-margin-y-px: ${Math.max(0.25, Math.min(2.5, this.settings.pageMarginYIn ?? 1.0))}in;
       }
       body.composition-mode-active .markdown-source-view.mod-cm6,
       body.composition-mode-active .cm-editor,
@@ -1443,6 +1448,13 @@ class CompositionModePlugin extends Plugin {
       }
       body.composition-mode-active .cm-content {
         font-size: inherit;
+      }
+      body.composition-mode-active .internal-embed.image-embed,
+      body.composition-mode-active .cm-content .image-embed {
+        width: ${Math.max(20, Math.min(100, this.settings.imageWidthPct || 100))}% !important;
+        max-width: ${Math.max(20, Math.min(100, this.settings.imageWidthPct || 100))}% !important;
+        margin-left: auto !important;
+        margin-right: auto !important;
       }
     `;
 
@@ -2146,6 +2158,54 @@ class CompositionModeSettingTab extends PluginSettingTab {
         .setDynamicTooltip()
         .onChange(async (v) => {
           this.plugin.settings.defaultPaperWidth = this.plugin.clampPaperWidth(v);
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('Image width')
+      .setDesc('Width of embedded images as a percentage of the text column. 100% fills the column edge-to-edge; 90% leaves a thin breathing margin. Individual images can still be overridden with ![[img.jpg|400]] syntax.')
+      .addSlider(s => s
+        .setLimits(50, 100, 5)
+        .setValue(this.plugin.settings.imageWidthPct || 100)
+        .setDynamicTooltip()
+        .onChange(async (v) => {
+          this.plugin.settings.imageWidthPct = v;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('Side margin (inches)')
+      .setDesc('Left/right margin between paper edge and text column. Typical manuscript: 1.0–1.5in. Narrower feels like a magazine column; wider feels like a book.')
+      .addSlider(s => s
+        .setLimits(0.5, 2.5, 0.05)
+        .setValue(this.plugin.settings.pageMarginXIn ?? 1.25)
+        .setDynamicTooltip()
+        .onChange(async (v) => {
+          this.plugin.settings.pageMarginXIn = v;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('Top/bottom margin (inches)')
+      .setDesc('Vertical margin above and below the text on each page. Typical: 0.75–1.25in.')
+      .addSlider(s => s
+        .setLimits(0.5, 2.0, 0.05)
+        .setValue(this.plugin.settings.pageMarginYIn ?? 1.0)
+        .setDynamicTooltip()
+        .onChange(async (v) => {
+          this.plugin.settings.pageMarginYIn = v;
+          await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('Max paper width (px)')
+      .setDesc('Absolute cap on paper width in pixels. Prevents the page from growing too wide on large external monitors. Typical values: 1100–1600.')
+      .addSlider(s => s
+        .setLimits(800, 2400, 50)
+        .setValue(this.plugin.settings.maxPaperWidthPx || 1400)
+        .setDynamicTooltip()
+        .onChange(async (v) => {
+          this.plugin.settings.maxPaperWidthPx = v;
           await this.plugin.saveSettings();
         }));
 

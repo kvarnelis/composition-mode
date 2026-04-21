@@ -196,11 +196,26 @@ body.composition-mode-active video {
   height: auto !important;
 }
 
+/* Image embeds fill the text column. Without an explicit width on the
+   embed wrapper, inline-block shrink-wraps around the <img>, which in
+   live preview can resolve to less than the full column and leaves
+   awkward gutters on either side of the image (very visible on large
+   external monitors where the column is wide). Forcing the wrapper to
+   block-level with width:100% + an explicit width on the nested img
+   stretches every image embed to fill the text column. */
 body.composition-mode-active .internal-embed,
 body.composition-mode-active .internal-embed.image-embed {
+  display: block !important;
+  width: 100% !important;
   max-width: 100% !important;
-  display: inline-block;
   vertical-align: middle;
+}
+
+body.composition-mode-active .internal-embed.image-embed img,
+body.composition-mode-active .cm-content .image-embed img {
+  width: 100% !important;
+  max-width: 100% !important;
+  height: auto !important;
 }
 
 /* ===== Hover zone ===== */
