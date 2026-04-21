@@ -220,20 +220,23 @@ body.composition-mode-active .internal-embed.image-embed {
   bottom: 0;
   left: 0;
   right: 0;
-  height: 40px;
+  min-height: 40px;
   background: rgba(20, 20, 20, 0.92);
   z-index: 9999;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 2rem;
-  padding: 0 2rem;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  padding: 0.4rem 1rem calc(0.4rem + env(safe-area-inset-bottom, 0px));
   font-family: var(--font-interface);
   font-size: 11px;
   color: rgba(255, 255, 255, 0.85);
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.15s ease;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
 }
 
 .composition-mode-control-bar.is-visible {
@@ -246,6 +249,8 @@ body.composition-mode-active .internal-embed.image-embed {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .composition-mode-label {
@@ -301,6 +306,7 @@ body.composition-mode-active .internal-embed.image-embed {
   min-width: 80px;
   text-align: right;
   font-size: 10px;
+  flex: 0 0 auto;
 }
 
 .composition-mode-zoom-display {
@@ -308,6 +314,13 @@ body.composition-mode-active .internal-embed.image-embed {
   font-variant-numeric: tabular-nums;
   min-width: 40px;
   font-size: 10px;
+  text-align: center;
+  flex: 0 0 auto;
+}
+
+.composition-mode-control-bar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 

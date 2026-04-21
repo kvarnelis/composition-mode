@@ -877,6 +877,18 @@ class CompositionModePlugin extends Plugin {
       hotkeys: [{ modifiers: ['Mod'], key: '0' }]
     });
 
+    this.addCommand({
+      id: 'zoom-in',
+      name: 'Zoom In (Composition Mode)',
+      callback: () => this.zoomIn()
+    });
+
+    this.addCommand({
+      id: 'zoom-out',
+      name: 'Zoom Out (Composition Mode)',
+      callback: () => this.zoomOut()
+    });
+
     // Manual diagnostic trigger — fires logBarDiagnostic() on demand.
     // Use when the auto-fire setTimeouts miss the bar-render window
     // (e.g. CM6's measure cycle lands after 2.4s for some reason).
@@ -1890,20 +1902,12 @@ class CompositionModePlugin extends Plugin {
     const zoomGroup = this.makeGroup('Zoom');
     const zoomMinus = this.makeEl('button', 'composition-mode-btn');
     zoomMinus.textContent = '−';
-    zoomMinus.addEventListener('click', () => {
-      this.currentZoom = this.clampZoom(this.currentZoom - 0.1);
-      this.applyStyles();
-      this.saveZoomLevel();
-    });
+    zoomMinus.addEventListener('click', () => this.zoomOut());
     const zoomEl = this.makeEl('div', 'composition-mode-zoom-display');
     this.zoomDisplay = zoomEl;
     const zoomPlus = this.makeEl('button', 'composition-mode-btn');
     zoomPlus.textContent = '+';
-    zoomPlus.addEventListener('click', () => {
-      this.currentZoom = this.clampZoom(this.currentZoom + 0.1);
-      this.applyStyles();
-      this.saveZoomLevel();
-    });
+    zoomPlus.addEventListener('click', () => this.zoomIn());
     const zoomReset = this.makeEl('button', 'composition-mode-btn');
     zoomReset.textContent = '1:1';
     zoomReset.addEventListener('click', () => {
@@ -2010,15 +2014,28 @@ class CompositionModePlugin extends Plugin {
     }
   }
 
+  zoomBy(delta) {
+    if (!this.isActive) return;
+    this.currentZoom = this.clampZoom((this.currentZoom || 1) + delta);
+    this.applyStyles();
+    this.saveZoomLevel();
+  }
+
+  zoomIn() {
+    this.zoomBy(0.1);
+  }
+
+  zoomOut() {
+    this.zoomBy(-0.1);
+  }
+
   setupZoomHandlers() {
     this.zoomHandler = (e) => {
       if (!this.isActive) return;
       if (e.ctrlKey || e.metaKey) {
         e.preventDefault();
         const delta = e.deltaY > 0 ? -0.05 : 0.05;
-        this.currentZoom = this.clampZoom(this.currentZoom + delta);
-        this.applyStyles();
-        this.saveZoomLevel();
+        this.zoomBy(delta);
       }
     };
     document.addEventListener('wheel', this.zoomHandler, { capture: true, passive: false });
