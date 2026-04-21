@@ -1,0 +1,350 @@
+/* Composition Mode — Max Bill Minimal */
+
+/* ===== Backdrop ===== */
+.composition-mode-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgb(160, 160, 160);
+  pointer-events: none;
+}
+
+/* ===== Hide chrome ===== */
+body.composition-mode-active .workspace-tab-header-container,
+body.composition-mode-active .workspace-ribbon,
+body.composition-mode-active .status-bar,
+body.composition-mode-active .sidebar-toggle-button,
+body.composition-mode-active .titlebar,
+body.composition-mode-active .view-header {
+  display: none !important;
+}
+
+/* ===== Workspace layer ===== */
+body.composition-mode-active .workspace {
+  position: relative;
+  z-index: 101;
+  background: transparent !important;
+}
+
+body.composition-mode-active .mod-root {
+  background: transparent !important;
+}
+
+body.composition-mode-active .workspace-leaf {
+  background: transparent !important;
+}
+
+/* ===== Paper (the leaf content) ===== */
+body.composition-mode-active .workspace-leaf-content {
+  --line-width: 100%;
+  --file-line-width: 100%;
+  --max-width: 100%;
+  background: var(--background-primary) !important;
+  width: 90%;
+  max-width: none;
+  margin: 0 auto;
+  min-height: 100vh;
+  box-shadow: none;
+  border-radius: 0;
+}
+
+/* Page margin variables live on cm-editor for reference */
+body.composition-mode-active .cm-editor {
+  /* Match a more word-processor-like default: 1.25in margins. */
+  --composition-mode-page-margin-x: 1.25in;
+  /* Give pages a real top/bottom margin too; 2rem looked visibly cramped. */
+  --composition-mode-page-margin-y: var(--composition-mode-page-margin-y-px, 1in);
+  background: var(--background-primary);
+}
+
+/* In composition mode, the actual "document" is the CM editor content.
+   Obsidian's inline title and Properties UI sit above that content and are
+   not part of the pagination math, which makes the first page look wrong.
+   Hide them entirely so the first visible page starts with the note body. */
+body.composition-mode-active .inline-title,
+body.composition-mode-active .metadata-container {
+  display: none !important;
+}
+
+/* Strip padding/margin from every wrapper between the paper
+   (.workspace-leaf-content) and the .cm-scroller. If anything in this
+   chain has padding, the scroller is narrower than the paper, and the
+   gray bar (which bleeds via negative margins to the scroller's edge)
+   stops short of the paper's edge — leaving white slivers on either
+   side. Obsidian and many themes add small paddings to .view-content
+   and .markdown-source-view by default, so we override aggressively. */
+body.composition-mode-active .view-content,
+body.composition-mode-active .view-content > div,
+body.composition-mode-active .markdown-source-view,
+body.composition-mode-active .markdown-source-view.mod-cm6,
+body.composition-mode-active .cm-editor {
+  padding: 0 !important;
+  margin: 0 !important;
+  width: 100% !important;
+  max-width: none !important;
+  box-sizing: border-box !important;
+  overflow: visible !important;
+}
+
+/* Padding on scroller so the page gradient covers full paper width including margins.
+   High-specificity selector + !important to win over Obsidian stock CSS. */
+body.composition-mode-active .markdown-source-view.mod-cm6 .cm-scroller {
+  padding: var(--composition-mode-page-margin-y) var(--composition-mode-page-margin-x) !important;
+  width: 100% !important;
+  box-sizing: border-box !important;
+}
+
+/* Remove any extra padding on content */
+body.composition-mode-active .cm-content {
+  padding-bottom: 0;
+  overflow: visible;
+}
+
+body.composition-mode-active .markdown-source-view.mod-cm6 .cm-scroller,
+body.composition-mode-active .markdown-source-view.mod-cm6 .cm-sizer,
+body.composition-mode-active .markdown-source-view.mod-cm6 .cm-contentContainer,
+body.composition-mode-active .markdown-source-view.mod-cm6 .cm-content {
+  max-width: none !important;
+}
+
+/* .cm-line must stay capped at cm-content width so images and other
+   inline content don't blow out past the text column. CM6 sizes
+   .cm-line via internal layout that ignores CSS max-width, so we
+   force an explicit width. Page-break bar widgets are siblings of
+   .cm-line, not children, so they're unaffected by this constraint. */
+body.composition-mode-active .markdown-source-view.mod-cm6 .cm-line {
+  width: 100% !important;
+  max-width: 100% !important;
+  box-sizing: border-box !important;
+}
+
+/* The page-gap bar bleeds out via negative margins on the .cm-content axis.
+   Every ancestor between the bar and the .cm-scroller's padding-box must
+   allow horizontal overflow, otherwise the bleed gets clipped and the
+   bar visually stops at the text column. CM6 defaults overflow:hidden on
+   .cm-sizer in some versions, which is the most likely culprit when the
+   var-set bleed appears to do nothing. Force visible. */
+body.composition-mode-active .markdown-source-view.mod-cm6 .cm-sizer,
+body.composition-mode-active .markdown-source-view.mod-cm6 .cm-contentContainer {
+  overflow: visible !important;
+}
+
+/* Same for the widget wrappers themselves — block widgets get inserted as
+   .cm-line siblings inside .cm-content, and the outer .composition-mode-
+   page-break div must let its child bar overflow horizontally. */
+.composition-mode-page-break {
+  overflow: visible !important;
+  contain: none !important;
+  display: block !important;
+  position: relative !important;
+}
+
+/* Hide gutters/line numbers to feel more like a page */
+body.composition-mode-active .cm-gutters {
+  display: none !important;
+}
+
+/* ===== Page breaks =====
+   Page breaks are block-level widgets inserted by pageBreakField in main.js.
+   Each widget renders two nested divs:
+     .composition-mode-page-break (outer) — pure layout container with
+        explicit height and padding-top/bottom set inline. No background.
+     .composition-mode-page-gap (inner) — the visible gray bar. Extends
+        horizontally beyond the content column via negative margins in px.
+        --composition-mode-page-margin-left-px / -right-px are measured
+        against the ACTIVE paper edges so the bar reaches the full page,
+        not just the current scroller padding box. Color matches the
+        backdrop so the bar looks like paper has been cut between pages
+        (Google Docs style). */
+.composition-mode-page-break {
+  margin-left: calc(-1 * var(--composition-mode-page-margin-left-px, var(--composition-mode-page-margin-x-px, 0px)));
+  margin-right: calc(-1 * var(--composition-mode-page-margin-right-px, var(--composition-mode-page-margin-x-px, 0px)));
+  width: calc(
+    100% +
+    var(--composition-mode-page-margin-left-px, var(--composition-mode-page-margin-x-px, 0px)) +
+    var(--composition-mode-page-margin-right-px, var(--composition-mode-page-margin-x-px, 0px))
+  );
+  box-sizing: border-box;
+  pointer-events: none;
+  user-select: none;
+}
+
+.composition-mode-page-gap {
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  width: 100%;
+  background: var(--composition-mode-gap-color, rgb(160, 160, 160));
+  pointer-events: none;
+  user-select: none;
+}
+
+/* ===== Images & embeds =====
+   Obsidian writes an explicit `width` attribute on embedded images equal
+   to the natural pixel dimensions. Our earlier rules strip max-width from
+   .cm-line (so lines span the paper), which unchains the containing-block
+   width reference the browser uses to resolve `max-width: 100%`, and the
+   inline width attribute ends up winning. Forcing `width: auto !important`
+   on every img in composition mode unsets the inline attribute, letting
+   `max-width: 100%` actually clamp to the nearest block ancestor (which
+   is the paper column). Universal selector is intentional: any image
+   anywhere in the composition-mode workspace should fit the column. UI
+   chrome images are hidden by other composition-mode rules. */
+body.composition-mode-active img,
+body.composition-mode-active video {
+  max-width: 100% !important;
+  width: auto !important;
+  height: auto !important;
+}
+
+body.composition-mode-active .internal-embed,
+body.composition-mode-active .internal-embed.image-embed {
+  max-width: 100% !important;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+/* ===== Hover zone ===== */
+.composition-mode-hover-zone {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 30px;
+  z-index: 9998;
+  background: transparent;
+}
+
+/* ===== Control bar ===== */
+.composition-mode-control-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 40px;
+  background: rgba(20, 20, 20, 0.92);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2rem;
+  padding: 0 2rem;
+  font-family: var(--font-interface);
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.85);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+.composition-mode-control-bar.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* ===== Control bar elements ===== */
+.composition-mode-control-group {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.composition-mode-label {
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  user-select: none;
+}
+
+.composition-mode-btn {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: rgba(255, 255, 255, 0.85);
+  padding: 3px 10px;
+  font-size: 10px;
+  cursor: pointer;
+  border-radius: 0;
+  font-family: var(--font-interface);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.composition-mode-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.4);
+}
+
+.composition-mode-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 80px;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.25);
+  outline: none;
+  border-radius: 0;
+}
+
+.composition-mode-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 8px;
+  height: 8px;
+  background: white;
+  cursor: pointer;
+  border-radius: 0;
+  border: none;
+}
+
+.composition-mode-word-count {
+  color: rgba(255, 255, 255, 0.6);
+  font-variant-numeric: tabular-nums;
+  min-width: 80px;
+  text-align: right;
+  font-size: 10px;
+}
+
+.composition-mode-zoom-display {
+  color: rgba(255, 255, 255, 0.6);
+  font-variant-numeric: tabular-nums;
+  min-width: 40px;
+  font-size: 10px;
+}
+
+
+/* ===== Scrollbar =====
+   Hidden in composition mode. The scrollbar previously took 6px of
+   layout on the right edge of .cm-scroller, which caused the page-gap
+   bar (bleeding to the scroller's content-box edge via negative margins)
+   to fall 6px short of the paper's visible right edge — a thin but
+   noticeable sliver of white between bar and paper. With the scrollbar
+   hidden, clientWidth equals offsetWidth, and the bar's negative-margin
+   bleed reaches flush with the paper edge. Trackpad scrolling still
+   works; keyboard (page up/down, arrow keys) still works. This matches
+   the distraction-free writing aesthetic composition mode is designed for. */
+body.composition-mode-active ::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+
+/* ===== Debug overlay =====
+   Toggled by the plugin's `debugVisualOverlay` flag (class applied to
+   document.body by applyDebugOverlay()). Purpose: make the measurement-
+   vs-paint question unambiguous in a screenshot. If the red bar is
+   visibly narrower than the green (view-content) outline, an ancestor
+   clips its bleed despite getBoundingClientRect reporting the full
+   width. Remove this block and the JS overlay hooks once the root cause
+   of the bar-width mismatch is identified and fixed. */
+body.composition-debug-overlay .composition-mode-page-gap {
+  background: red !important;
+  outline: 2px solid yellow !important;
+}
+body.composition-debug-overlay .view-content {
+  box-shadow: inset 0 0 0 2px lime !important;
+}
+body.composition-debug-overlay .cm-scroller {
+  box-shadow: inset 0 0 0 2px cyan !important;
+}
+body.composition-debug-overlay .workspace-leaf-content {
+  box-shadow: inset 0 0 0 2px magenta !important;
+}

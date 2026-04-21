@@ -1,0 +1,9 @@
+{
+  "id": "composition-mode",
+  "name": "Composition Mode",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Distraction-free writing mode with paper container, zoom, and adjustable background.",
+  "author": "netlab",
+  "isDesktopOnly": true
+}
