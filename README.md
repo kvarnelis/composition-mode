@@ -14,6 +14,10 @@ A distraction-free writing mode for Obsidian that turns the editor into a pagina
 - **No status bar, no tab headers** while active. If sidebars are open, they will show. I recommend closing them first.
 - **Per-note zoom memory**: Each note remembers its zoom level.
 
+## What it its limits are
+
+- **Paper-like pages**: Images and texts only, I haven't tried it with any other graphic elements like Mermaid diagrams or tables. 
+
 ## Settings
 
 | Setting | Default | Notes |
