@@ -2,6 +2,8 @@
 
 A distraction-free writing mode for Obsidian that turns the editor into a paginated, paper-like page. Designed for long-form writing where you want to see your text the way it will eventually print, without chrome, sidebars, or line-length surprises.
 
+![Composition Mode in action — a paginated page on a neutral gray backdrop, with text column and embedded image](docs/screenshot.jpg)
+
 > **⚠️ New and experimental.** This is a young plugin. It has only been tested with the **Minimal** theme on desktop. Other themes may produce visual quirks around image embeds, page-gap bars, or text column sizing. Bug reports welcome — please include your theme name and a screenshot.
 
 ## What it does
