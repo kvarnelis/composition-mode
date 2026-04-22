@@ -11,7 +11,7 @@ A distraction-free writing mode for Obsidian that turns the editor into a pagina
 - **Paper-like pages**: Your note renders as a stack of pages separated by visible gaps (Google Docs style), targeting a configurable word count per page.
 - **Paginated view at any zoom**: Uses CSS `zoom` to magnify without reflowing, so page breaks stay stable while you scale up or down.
 - **Soft backdrop**: A neutral gray behind the page, adjustable from light to near-black, to take the room out of your peripheral vision.
-- **No sidebars, no status bar, no tab headers** while active.
+- **No status bar, no tab headers** while active. If sidebars are open, they will show. I recommend closing them first.
 - **Per-note zoom memory**: Each note remembers its zoom level.
 
 ## Settings
