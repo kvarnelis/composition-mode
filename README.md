@@ -48,7 +48,7 @@ A distraction-free writing mode for Obsidian that turns the editor into a pagina
 
 - Open a note and toggle **Composition Mode** from the command palette (or bind a hotkey).
 - A control bar appears on mouseover at the bottom edge: zoom, paper width, background slider, word count.
-- Exit with the same command.
+- Exit with the escape key or via the button in the control bar. 
 
 ## Known limitations
 
