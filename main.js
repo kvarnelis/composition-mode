@@ -1959,6 +1959,24 @@ class CompositionModePlugin extends Plugin {
     // Keep the value so applyStyles() still has a width to work with.
     this.paperWidth = 90;
 
+    // Side margins slider
+    const sideMarginGroup = this.makeGroup('Side');
+    const sideMarginSlider = this.makeSlider(0.25, 2.5, 0.25, this.settings.pageMarginXIn ?? 1.25, (v) => {
+      this.settings.pageMarginXIn = v;
+      this.saveSettings();
+      this.applyStyles();
+    });
+    sideMarginGroup.appendChild(sideMarginSlider);
+
+    // Top/bottom margins slider
+    const topMarginGroup = this.makeGroup('Top');
+    const topMarginSlider = this.makeSlider(0.25, 2, 0.25, this.settings.pageMarginYIn ?? 1.0, (v) => {
+      this.settings.pageMarginYIn = v;
+      this.saveSettings();
+      this.applyStyles();
+    });
+    topMarginGroup.appendChild(topMarginSlider);
+
     // Background fade slider
     const fadeGroup = this.makeGroup('Background');
     const fadeSlider = this.makeSlider(0, 100, 5, this.backgroundFade * 100, (v) => {
@@ -1977,7 +1995,7 @@ class CompositionModePlugin extends Plugin {
     exitBtn.textContent = 'Exit';
     exitBtn.addEventListener('click', () => this.deactivate());
 
-    this.controlBar.append(zoomGroup, paperSizeGroup, pagesGroup, fadeGroup, wordCountEl, exitBtn);
+    this.controlBar.append(zoomGroup, paperSizeGroup, pagesGroup, sideMarginGroup, topMarginGroup, fadeGroup, wordCountEl, exitBtn);
     document.body.appendChild(this.controlBar);
 
     this.updateZoomDisplay();

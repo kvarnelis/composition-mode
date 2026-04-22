@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.2 — 2026-04-22
+
+- **Exit button** in the control bar for quick escape from composition mode.
+- **Margin sliders** in the control bar — adjust side and top/bottom margins without opening settings.
+
 ## 1.1.0 — 2026-04-21
 
 Added four new settings for taming composition mode on large external monitors and tuning page aesthetics:

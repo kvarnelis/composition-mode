@@ -218,6 +218,22 @@ body.composition-mode-active .cm-content .image-embed img {
   height: auto !important;
 }
 
+/* ===== Modals & Command Palette =====
+   Obsidian renders modals inside .app-container. Our backdrop is a sibling
+   of app-container at z-index 100. Due to stacking context rules, children
+   of app-container (like modals) can't appear above app-container's siblings
+   unless app-container itself has a higher z-index. Give app-container a
+   z-index that puts it above the backdrop, allowing modals to show. */
+body.composition-mode-active .app-container {
+  position: relative;
+  z-index: 200 !important;
+}
+
+/* Ensure modals are above workspace elements inside app-container */
+body.composition-mode-active .modal-container {
+  z-index: 10001 !important;
+}
+
 /* ===== Hover zone ===== */
 .composition-mode-hover-zone {
   position: fixed;
