@@ -333,6 +333,16 @@ body.composition-mode-active .cm-content .image-embed img {
   flex: 0 0 auto;
 }
 
+.composition-mode-exit-btn {
+  margin-left: 1rem;
+  border-color: rgba(255, 255, 255, 0.4);
+}
+
+.composition-mode-exit-btn:hover {
+  background: rgba(255, 100, 100, 0.15);
+  border-color: rgba(255, 150, 150, 0.6);
+}
+
 .composition-mode-control-bar::-webkit-scrollbar {
   width: 0;
   height: 0;

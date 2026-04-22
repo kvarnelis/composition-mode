@@ -1972,7 +1972,12 @@ class CompositionModePlugin extends Plugin {
     this.wordCountEl = wordCountEl;
     this.updateWordCount();
 
-    this.controlBar.append(zoomGroup, paperSizeGroup, pagesGroup, fadeGroup, wordCountEl);
+    // Exit button
+    const exitBtn = this.makeEl('button', 'composition-mode-btn composition-mode-exit-btn');
+    exitBtn.textContent = 'Exit';
+    exitBtn.addEventListener('click', () => this.deactivate());
+
+    this.controlBar.append(zoomGroup, paperSizeGroup, pagesGroup, fadeGroup, wordCountEl, exitBtn);
     document.body.appendChild(this.controlBar);
 
     this.updateZoomDisplay();
