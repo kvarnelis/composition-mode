@@ -8,6 +8,7 @@ const DEFAULT_SETTINGS = {
   defaultPaperWidth: 90,
   maxPaperWidthPx: 1400,
   imageWidthPct: 100,
+  fontSizePt: 12,
   pageMarginXIn: 1.25,
   pageMarginYIn: 1.0,
   showPageBreaks: true,
@@ -21,8 +22,12 @@ const MIN_PAPER_WIDTH = 60;
 const MAX_PAPER_WIDTH = 95;
 const MIN_VISUAL_ZOOM = 0.25;
 const MAX_VISUAL_ZOOM = 2;
+const MIN_FONT_SIZE_PT = 8;
+const MAX_FONT_SIZE_PT = 24;
 
 const PAPER_SIZES = {
+  trade6x9: { label: 'Trade 6 × 9', width: 6, height: 9 },
+  academic7x10: { label: 'Academic 7 × 10', width: 7, height: 10 },
   letter: { label: 'Letter', width: 8.5, height: 11 },
   a4: { label: 'A4', width: 8.27, height: 11.69 }
 };
@@ -200,6 +205,16 @@ function isPureImageLine(text) {
   const t = text.trim();
   return /^!\[\[[^\]|#]+?(?:[|#][^\]]*)?\]\]$/.test(t) ||
          /^!\[[^\]]*\]\([^\s)]+\)$/.test(t);
+}
+
+// Detect a manual page-break marker on its own line. Accepts either an
+// HTML comment (<!-- pagebreak -->) or Obsidian's native comment syntax
+// (%%pagebreak%%). Case-insensitive, flexible whitespace. Must be the
+// whole line — inline occurrences are ignored so that quoting the marker
+// in prose doesn't accidentally trigger a break.
+function isPageBreakMarker(text) {
+  const t = text.trim();
+  return /^(?:<!--\s*pagebreak\s*-->|%%\s*pagebreak\s*%%)$/i.test(t);
 }
 
 // Split a source line into alternating text and image segments. Each
@@ -398,6 +413,127 @@ function estimateParagraphHeight(block, cfg, measurer) {
     }
   }
   return height;
+}
+
+function estimateTextHeight(text, headingLevel, cfg, measurer) {
+  const measuredText = normalizeLineForMeasurement(text || '', cfg);
+  const visualLines = measurer(measuredText);
+  const scale = (headingLevel >= 1 && headingLevel <= 3) ? cfg.headingScale : 1;
+  return visualLines * cfg.lineHeight * scale;
+}
+
+function chooseReadableSplitOffset(text, maxOffset) {
+  const safeMax = Math.max(0, Math.min(text.length, maxOffset));
+  const minOffset = Math.min(safeMax, Math.max(40, Math.floor(text.length * 0.05)));
+  if (safeMax <= minOffset) return null;
+
+  // Page breaks should behave like physical page bottoms, not like
+  // editorial paragraph/sentence breaks. The visual-line estimator already
+  // gives us the last word that fits on the page; choose the nearest word
+  // boundary before that point. Earlier versions preferred sentence endings
+  // first, which made the inserted page gap look like an intentional
+  // paragraph break and could jump back several lines.
+  const prefix = text.slice(0, safeMax);
+  let best = null;
+  let m;
+  const whitespace = /\s+/g;
+  while ((m = whitespace.exec(prefix)) !== null) {
+    const candidate = m.index + m[0].length;
+    if (candidate >= minOffset && candidate <= safeMax) best = candidate;
+  }
+
+  return best;
+}
+
+function findTextOffsetForVisualLines(text, cfg, maxLines) {
+  if (!text || maxLines < 3 || !cfg.contentWidth || cfg.contentWidth <= 0) return null;
+
+  const ctx = getMeasureCtx();
+  ctx.font = cfg.fontSpec || '400 16px sans-serif';
+  const spaceWidth = ctx.measureText(' ').width;
+  const tokens = Array.from(text.matchAll(/\S+\s*/g));
+
+  let lines = 1;
+  let lineWidth = 0;
+  let lastFitOffset = 0;
+
+  for (const token of tokens) {
+    const raw = token[0];
+    const word = raw.trim();
+    if (!word) continue;
+    const wordWidth = ctx.measureText(word).width;
+    const startsNewLine =
+      wordWidth > cfg.contentWidth
+        ? lineWidth > 0
+        : lineWidth > 0 && lineWidth + spaceWidth + wordWidth > cfg.contentWidth;
+
+    let lineCost = 0;
+    if (wordWidth > cfg.contentWidth) {
+      lineCost = (lineWidth > 0 ? 1 : 0) + Math.max(1, Math.ceil(wordWidth / cfg.contentWidth)) - 1;
+    } else if (startsNewLine) {
+      lineCost = 1;
+    }
+
+    if (lines + lineCost > maxLines) break;
+
+    if (wordWidth > cfg.contentWidth) {
+      if (lineWidth > 0) lines++;
+      const wordLines = Math.max(1, Math.ceil(wordWidth / cfg.contentWidth));
+      lines += wordLines - 1;
+      lineWidth = wordWidth % cfg.contentWidth || cfg.contentWidth;
+    } else if (startsNewLine) {
+      lines++;
+      lineWidth = wordWidth;
+    } else {
+      lineWidth += (lineWidth > 0 ? spaceWidth : 0) + wordWidth;
+    }
+
+    lastFitOffset = token.index + raw.length;
+  }
+
+  return lastFitOffset > 0 ? lastFitOffset : null;
+}
+
+function isSplittableTextBlock(block) {
+  if (!block || !block.lines || block.lines.length !== 1) return null;
+  const line = block.lines[0];
+  return !!(
+    line &&
+    !line.isImage &&
+    !line.segments &&
+    line.headingLevel === 0 &&
+    Number.isFinite(line.from) &&
+    Number.isFinite(line.to)
+  );
+}
+
+function findMidParagraphSplit(block, cfg, measurer, availableHeight, startOffset = 0) {
+  if (!isSplittableTextBlock(block)) return null;
+  const line = block.lines[0];
+  const safeStartOffset = Math.max(0, Math.min(line.text.length - 1, startOffset || 0));
+  if (availableHeight < cfg.lineHeight * 3) return null;
+
+  // Use ceil rather than floor so fractional line-height measurement drift
+  // doesn't leave a conspicuously short final line before the page gap.
+  const maxLines = Math.max(3, Math.ceil(availableHeight / cfg.lineHeight));
+  const remainingText = line.text.slice(safeStartOffset);
+  const rawOffset = findTextOffsetForVisualLines(remainingText, cfg, maxLines);
+  const splitOffset = chooseReadableSplitOffset(remainingText, rawOffset || 0);
+  const absoluteSplitOffset = safeStartOffset + (splitOffset || 0);
+  if (!splitOffset || absoluteSplitOffset <= safeStartOffset || absoluteSplitOffset >= line.text.length) return null;
+
+  const beforeText = line.text.slice(safeStartOffset, absoluteSplitOffset);
+  const afterText = line.text.slice(absoluteSplitOffset);
+  const beforeHeight = estimateTextHeight(beforeText, 0, cfg, measurer);
+  const afterHeight = estimateTextHeight(afterText, 0, cfg, measurer);
+  if (beforeHeight <= 0 || afterHeight <= 0 || beforeHeight > availableHeight + cfg.lineHeight) return null;
+
+  return {
+    pos: line.from + absoluteSplitOffset,
+    splitOffset: absoluteSplitOffset,
+    beforeHeight,
+    afterHeight
+  };
 }
 
 // PageGapWidget renders two nested divs:
@@ -623,10 +759,21 @@ function computePageBreaks(state) {
   const blocks = [];
   let current = null;
   let pendingBlankLines = 0;
+  // Set true when we pass a <!-- pagebreak --> / %%pagebreak%% marker line.
+  // Consumed by the next block created, which will force a page break before
+  // itself regardless of how much content has accumulated on the current page.
+  let forceBreakNext = false;
   const totalLines = doc.lines;
   for (let lineNum = (skippedFrontmatterLines ? skippedFrontmatterLines + 1 : 1); lineNum <= totalLines; lineNum++) {
     const line = doc.line(lineNum);
     const text = line.text;
+
+    if (isPageBreakMarker(text)) {
+      if (current) { blocks.push(current); current = null; }
+      forceBreakNext = true;
+      continue;
+    }
+
     if (text.trim() === '') {
       if (current) { blocks.push(current); current = null; }
       pendingBlankLines += 1;
@@ -638,8 +785,11 @@ function computePageBreaks(state) {
       blocks.push({
         startPos: line.from,
         blankLinesBefore: pendingBlankLines,
+        forceBreakBefore: forceBreakNext,
         lines: [{
           text,
+          from: line.from,
+          to: line.to,
           isImage: true,
           imageKey: extractImageKey(text),
           headingLevel: 0,
@@ -647,6 +797,7 @@ function computePageBreaks(state) {
         }]
       });
       pendingBlankLines = 0;
+      forceBreakNext = false;
       continue;
     }
 
@@ -654,9 +805,11 @@ function computePageBreaks(state) {
       current = {
         startPos: line.from,
         lines: [],
-        blankLinesBefore: pendingBlankLines
+        blankLinesBefore: pendingBlankLines,
+        forceBreakBefore: forceBreakNext
       };
       pendingBlankLines = 0;
+      forceBreakNext = false;
     }
     const headingMatch = /^(#{1,6})\s/.exec(text);
     // Detect inline image embeds mid-text so their heights reach the
@@ -683,14 +836,18 @@ function computePageBreaks(state) {
       if (current) { blocks.push(current); current = null; }
 
       let blankLinesBeforeForSeg = pendingBlankLines;
+      let forceBreakForSeg = forceBreakNext;
       for (const seg of segments) {
         if (!seg.text || !seg.text.trim()) continue;
         if (seg.type === 'image') {
           blocks.push({
             startPos: line.from + seg.from,
             blankLinesBefore: blankLinesBeforeForSeg,
+            forceBreakBefore: forceBreakForSeg,
             lines: [{
               text: seg.text,
+              from: line.from + seg.from,
+              to: line.from + seg.to,
               isImage: true,
               imageKey: seg.imageKey,
               headingLevel: 0,
@@ -701,8 +858,11 @@ function computePageBreaks(state) {
           blocks.push({
             startPos: line.from + seg.from,
             blankLinesBefore: blankLinesBeforeForSeg,
+            forceBreakBefore: forceBreakForSeg,
             lines: [{
               text: seg.text,
+              from: line.from + seg.from,
+              to: line.from + seg.to,
               isImage: false,
               imageKey: null,
               headingLevel: 0,
@@ -711,13 +871,17 @@ function computePageBreaks(state) {
           });
         }
         blankLinesBeforeForSeg = 0;
+        forceBreakForSeg = false;
       }
       pendingBlankLines = 0;
+      forceBreakNext = false;
       continue;
     }
 
     current.lines.push({
       text,
+      from: line.from,
+      to: line.to,
       isImage: false,
       imageKey: null,
       headingLevel: headingMatch ? headingMatch[1].length : 0,
@@ -740,9 +904,13 @@ function computePageBreaks(state) {
 //   - content must stop by physicalTop + pageHeight - pageMarginY
 //   - the gray bar renders at physicalTop + pageHeight
 //
-// The 0.5 floor prevents anemic pages when a giant paragraph appears on a
-// mostly-empty page — in that case we accept overshoot rather than emit a
-// one-short-paragraph page followed by a giant one.
+// The 0.5 floor prevents anemic pages when the current page is mostly
+// empty — in that case we accept overshoot rather than emit a one-short-
+// paragraph page followed by a large one. Important: this check must NOT
+// suppress breaks before paragraphs that are themselves taller than a page.
+// On narrow book trims, ordinary paragraphs can exceed a page's content
+// height; refusing to break before them makes the editor appear to have
+// "lost" page breaks entirely.
   const ranges = [];
   const pageContentHeight = Math.max(lineHeight * 3, pageHeight - (2 * pageMarginY));
   let pagePhysicalTopY = 0;
@@ -752,6 +920,26 @@ function computePageBreaks(state) {
   let contentBoundary = nextPageBoundary - pageMarginY;
   let breakCount = 0;
 
+  const insertPageBreakAt = (pos, contentEndY) => {
+    const unused = Math.max(0, nextPageBoundary - contentEndY);
+    const totalHeight = unused + barHeight + pageMarginY;
+
+    ranges.push(
+      Decoration.widget({
+        block: true,
+        side: -1,
+        widget: new PageGapWidget(totalHeight, barHeight, pageMarginY)
+      }).range(pos)
+    );
+    breakCount++;
+
+    pagePhysicalTopY = Math.max(nextPageBoundary, contentEndY) + barHeight;
+    contentStartY = pagePhysicalTopY + pageMarginY;
+    y = contentStartY;
+    nextPageBoundary = pagePhysicalTopY + pageHeight;
+    contentBoundary = nextPageBoundary - pageMarginY;
+  };
+
   for (let i = 0; i < blocks.length; i++) {
     const block = blocks[i];
 
@@ -759,42 +947,78 @@ function computePageBreaks(state) {
     // the widget (their position in the doc precedes block.startPos), so
     // they belong to the closing page.
     y += block.blankLinesBefore * lineHeight;
+    let forceBreak = !!block.forceBreakBefore;
 
-    // If a giant previous block has already pushed y past the current
-    // page's content area without a break, fast-forward so subsequent
-    // breaks fall on actual upcoming pages instead of one already behind us.
-    while (y > contentBoundary) {
-      pagePhysicalTopY += pageHeight;
-      contentStartY = pagePhysicalTopY + pageMarginY;
-      nextPageBoundary = pagePhysicalTopY + pageHeight;
-      contentBoundary = nextPageBoundary - pageMarginY;
+    // If the previous block already overflowed the current page, still
+    // render a visible page gap before this block. We can't split inside the
+    // oversized paragraph, but we can prevent all subsequent page breaks from
+    // silently disappearing behind a fast-forwarded y position.
+    if (i > 0 && y > contentBoundary) {
+      insertPageBreakAt(block.startPos, y);
+      forceBreak = false;
     }
 
     const paraHeight = estimateParagraphHeight(block, cfg, measurer);
 
-    if (i > 0 && paraHeight <= pageHeight) {
+    // A manual <!-- pagebreak --> / %%pagebreak%% marker forces a break
+    // before this block regardless of how full the page is. Oversized
+    // paragraphs are allowed to start on a fresh page.
+    if (i > 0 && forceBreak) {
+      insertPageBreakAt(block.startPos, y);
+      forceBreak = false;
+    }
+
+    // Plain single-line prose paragraphs can be split by placing multiple
+    // block widgets at word-boundaries inside the source line. This lets
+    // book-sized pages behave like actual pages instead of forcing every
+    // long paragraph to remain an indivisible block.
+    if (isSplittableTextBlock(block)) {
+      const line = block.lines[0];
+      let consumedOffset = 0;
+      let safety = 0;
+
+      while (consumedOffset < line.text.length && safety < 100) {
+        safety++;
+        const remainingText = line.text.slice(consumedOffset);
+        const remainingHeight = estimateTextHeight(remainingText, 0, cfg, measurer);
+
+        if ((y + remainingHeight) <= contentBoundary) {
+          y += remainingHeight;
+          consumedOffset = line.text.length;
+          break;
+        }
+
+        const availableHeight = Math.max(0, contentBoundary - y);
+        const split = findMidParagraphSplit(block, cfg, measurer, availableHeight, consumedOffset);
+        if (!split) {
+          const heightUsed = y - contentStartY;
+          const pageHasEnough = heightUsed >= pageContentHeight * 0.5;
+          if (i > 0 && pageHasEnough && y > contentStartY) {
+            insertPageBreakAt(line.from + consumedOffset, y);
+            continue;
+          }
+          // Fallback: if we can't find a safe intra-paragraph word boundary
+          // (very short remaining fragment, pathological long word, etc.),
+          // keep the paragraph visible rather than looping forever.
+          y += remainingHeight;
+          consumedOffset = line.text.length;
+          break;
+        }
+
+        insertPageBreakAt(split.pos, y + split.beforeHeight);
+        consumedOffset = split.splitOffset;
+      }
+
+      continue;
+    }
+
+    if (i > 0) {
       const wouldOvershoot = (y + paraHeight) > contentBoundary;
       const heightUsed = y - contentStartY;
       const pageHasEnough = heightUsed >= pageContentHeight * 0.5;
+
       if (wouldOvershoot && pageHasEnough) {
-        const unused = Math.max(0, nextPageBoundary - y);
-        const totalHeight = unused + barHeight + pageMarginY;
-
-        ranges.push(
-          Decoration.widget({
-            block: true,
-            side: -1,
-            widget: new PageGapWidget(totalHeight, barHeight, pageMarginY)
-          }).range(block.startPos)
-        );
-        breakCount++;
-
-        // Advance past the widget. The new page begins here.
-        pagePhysicalTopY = nextPageBoundary + barHeight;
-        contentStartY = pagePhysicalTopY + pageMarginY;
-        y = contentStartY;
-        nextPageBoundary = pagePhysicalTopY + pageHeight;
-        contentBoundary = nextPageBoundary - pageMarginY;
+        insertPageBreakAt(block.startPos, y);
       }
     }
 
@@ -893,6 +1117,18 @@ class CompositionModePlugin extends Plugin {
       callback: () => this.zoomOut()
     });
 
+    this.addCommand({
+      id: 'increase-type-size',
+      name: 'Increase Type Size (Composition Mode)',
+      callback: () => this.typeSizeBy(0.5)
+    });
+
+    this.addCommand({
+      id: 'decrease-type-size',
+      name: 'Decrease Type Size (Composition Mode)',
+      callback: () => this.typeSizeBy(-0.5)
+    });
+
     // Manual diagnostic trigger — fires logBarDiagnostic() on demand.
     // Use when the auto-fire setTimeouts miss the bar-render window
     // (e.g. CM6's measure cycle lands after 2.4s for some reason).
@@ -952,6 +1188,7 @@ class CompositionModePlugin extends Plugin {
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     this.settings.defaultPaperWidth = this.clampPaperWidth(this.settings.defaultPaperWidth);
+    this.settings.fontSizePt = this.clampFontSizePt(this.settings.fontSizePt);
     setDebugModeEnabled(this.settings.debugMode);
   }
 
@@ -972,6 +1209,13 @@ class CompositionModePlugin extends Plugin {
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return DEFAULT_SETTINGS.defaultPaperWidth;
     return Math.max(MIN_PAPER_WIDTH, Math.min(MAX_PAPER_WIDTH, numeric));
+  }
+
+  clampFontSizePt(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return DEFAULT_SETTINGS.fontSizePt;
+    const roundedToHalfPoint = Math.round(numeric * 2) / 2;
+    return Math.max(MIN_FONT_SIZE_PT, Math.min(MAX_FONT_SIZE_PT, roundedToHalfPoint));
   }
 
   // Resolve DOM nodes from the ACTUAL live CM6 editor first, then walk
@@ -1030,6 +1274,7 @@ class CompositionModePlugin extends Plugin {
   logMetricSnapshot(reason, elements, meta = {}) {
     const activeFile = this.app.workspace.getActiveFile();
     const activeFilePath = activeFile?.path || '(none)';
+    const paperSizeDef = this.getPaperSizeDef();
     const nodes = {
       workspaceLeaf: elements?.container || null,
       workspaceLeafContent: elements?.leafContent || null,
@@ -1048,7 +1293,11 @@ class CompositionModePlugin extends Plugin {
       ` file=${activeFilePath}` +
       ` active=${this.isActive ? 'yes' : 'no'}` +
       ` paperSize=${this.paperSize}` +
+      ` paperDims=${paperSizeDef.width}x${paperSizeDef.height}` +
+      ` paperCssWidth=${paperSizeDef.width}in` +
       ` paperWidthPct=${this.paperWidth}` +
+      ` marginX=${Math.round(this.getEffectivePageMarginXIn() * 100) / 100}` +
+      ` marginY=${Math.round(this.getEffectivePageMarginYIn() * 100) / 100}` +
       ` zoom=${Math.round((this.currentZoom || 1) * 1000) / 1000}` +
       ` bgFade=${Math.round((this.backgroundFade || 0) * 1000) / 1000}` +
       ` showBreaks=${this.showPageBreaks ? 'yes' : 'no'}` +
@@ -1240,6 +1489,30 @@ class CompositionModePlugin extends Plugin {
     return Math.max(0.88, Math.min(1.05, 1 + (this.paperWidth - DEFAULT_SETTINGS.defaultPaperWidth) * 0.004));
   }
 
+  getPaperSizeDef() {
+    return PAPER_SIZES[this.paperSize] || PAPER_SIZES.letter;
+  }
+
+  getEffectivePageMarginXIn() {
+    const requested = Number(this.settings.pageMarginXIn ?? DEFAULT_SETTINGS.pageMarginXIn);
+    const clampedRequested = Number.isFinite(requested) ? Math.max(0.25, Math.min(3, requested)) : DEFAULT_SETTINGS.pageMarginXIn;
+    const paperWidth = this.getPaperSizeDef().width;
+    // Small book trims become unusable with manuscript margins. Keep at
+    // least a 4-inch text block when possible: Trade caps at 1.0in,
+    // Academic at 1.5in, while Letter/A4 remain generous.
+    const maxMarginForReadableColumn = Math.max(0.45, (paperWidth - 4.0) / 2);
+    return Math.min(clampedRequested, maxMarginForReadableColumn);
+  }
+
+  getEffectivePageMarginYIn() {
+    const requested = Number(this.settings.pageMarginYIn ?? DEFAULT_SETTINGS.pageMarginYIn);
+    const clampedRequested = Number.isFinite(requested) ? Math.max(0.25, Math.min(2.5, requested)) : DEFAULT_SETTINGS.pageMarginYIn;
+    const paperHeight = this.getPaperSizeDef().height;
+    // Keep at least ~6.5in of vertical content on smaller book pages.
+    const maxMarginForReadablePage = Math.max(0.5, (paperHeight - 6.5) / 2);
+    return Math.min(clampedRequested, maxMarginForReadablePage);
+  }
+
   clampZoom(value) {
     if (!Number.isFinite(value)) return 1;
     return Math.max(MIN_VISUAL_ZOOM, Math.min(MAX_VISUAL_ZOOM, value));
@@ -1398,6 +1671,12 @@ class CompositionModePlugin extends Plugin {
     const bgColor = `rgb(${grayValue}, ${grayValue}, ${grayValue})`;
     const textScale = this.getPaperTextScale();
     const visualZoom = this.clampZoom(this.currentZoom || 1);
+    const fontSizePt = this.clampFontSizePt(this.settings.fontSizePt);
+    const effectiveFontSizePt = Math.round(fontSizePt * textScale * 100) / 100;
+    const paperSizeDef = this.getPaperSizeDef();
+    const paperWidthCss = `${paperSizeDef.width}in`;
+    const effectiveMarginXIn = this.getEffectivePageMarginXIn();
+    const effectiveMarginYIn = this.getEffectivePageMarginYIn();
 
     if (this.backdrop) {
       this.backdrop.style.backgroundColor = bgColor;
@@ -1426,7 +1705,7 @@ class CompositionModePlugin extends Plugin {
 
     this.styleEl.textContent = `
       body.composition-mode-active .workspace-leaf-content {
-        width: ${this.paperWidth}% !important;
+        width: ${paperWidthCss} !important;
         min-width: min(160px, calc(100vw - 6rem)) !important;
         max-width: min(calc(100vw - 6rem), ${Math.max(400, this.settings.maxPaperWidthPx || 1400)}px) !important;
         box-sizing: border-box !important;
@@ -1434,8 +1713,8 @@ class CompositionModePlugin extends Plugin {
         zoom: ${visualZoom};
       }
       body.composition-mode-active .cm-editor {
-        --composition-mode-page-margin-x: ${Math.max(0.25, Math.min(3, this.settings.pageMarginXIn ?? 1.25))}in;
-        --composition-mode-page-margin-y-px: ${Math.max(0.25, Math.min(2.5, this.settings.pageMarginYIn ?? 1.0))}in;
+        --composition-mode-page-margin-x: ${effectiveMarginXIn}in;
+        --composition-mode-page-margin-y-px: ${effectiveMarginYIn}in;
       }
       body.composition-mode-active .markdown-source-view.mod-cm6,
       body.composition-mode-active .cm-editor,
@@ -1444,7 +1723,7 @@ class CompositionModePlugin extends Plugin {
         background: transparent !important;
       }
       body.composition-mode-active .markdown-source-view.mod-cm6 {
-        font-size: ${textScale}em;
+        font-size: ${effectiveFontSizePt}pt;
       }
       body.composition-mode-active .cm-content {
         font-size: inherit;
@@ -1459,15 +1738,20 @@ class CompositionModePlugin extends Plugin {
     `;
 
     this.updateZoomDisplay();
+    this.updateTypeDisplay();
 
     // Fast path: if only zoom changed, skip the full rebuild. CSS zoom is
     // pure magnification — page breaks are identical at every zoom level.
     const zoomOnly = (
       visualZoom !== this._prevZoom &&
+      fontSizePt === this._prevFontSizePt &&
+      this.paperSize === this._prevPaperSize &&
       textScale === this._prevTextScale &&
       this.paperWidth === this._prevPaperWidth
     );
     this._prevZoom = visualZoom;
+    this._prevFontSizePt = fontSizePt;
+    this._prevPaperSize = this.paperSize;
     this._prevTextScale = textScale;
     this._prevPaperWidth = this.paperWidth;
 
@@ -1705,7 +1989,7 @@ class CompositionModePlugin extends Plugin {
     // Gap height at reference scale. CSS transform zoom handles visual
     // scaling — no need to multiply by zoom here.
     pageBreakConfig.gapHeight = this.settings.pageGapHeight || 60;
-    const paperSizeDef = PAPER_SIZES[this.paperSize] || PAPER_SIZES.letter;
+    const paperSizeDef = this.getPaperSizeDef();
     pageBreakConfig.paperRatio = paperSizeDef.height / paperSizeDef.width;
 
     // One-shot geometry / font-metric reads. These are the ONLY DOM reads
@@ -1927,14 +2211,29 @@ class CompositionModePlugin extends Plugin {
     });
     zoomGroup.append(zoomMinus, zoomEl, zoomPlus, zoomReset);
 
+    // Type size controls
+    const typeGroup = this.makeGroup('Type');
+    const typeMinus = this.makeEl('button', 'composition-mode-btn');
+    typeMinus.textContent = '−';
+    typeMinus.addEventListener('click', () => this.typeSizeBy(-0.5));
+    const typeEl = this.makeEl('div', 'composition-mode-type-display');
+    this.typeDisplay = typeEl;
+    const typePlus = this.makeEl('button', 'composition-mode-btn');
+    typePlus.textContent = '+';
+    typePlus.addEventListener('click', () => this.typeSizeBy(0.5));
+    typeGroup.append(typeMinus, typeEl, typePlus);
+
     // Paper size toggle
     const paperSizeGroup = this.makeGroup('Paper');
     const paperSizeBtn = this.makeEl('button', 'composition-mode-btn');
-    paperSizeBtn.textContent = PAPER_SIZES[this.paperSize].label;
+    paperSizeBtn.textContent = (PAPER_SIZES[this.paperSize] || PAPER_SIZES.letter).label;
     this.paperSizeBtn = paperSizeBtn;
     paperSizeBtn.addEventListener('click', () => {
-      this.paperSize = this.paperSize === 'letter' ? 'a4' : 'letter';
-      this.paperSizeBtn.textContent = PAPER_SIZES[this.paperSize].label;
+      const paperSizeKeys = Object.keys(PAPER_SIZES);
+      const currentIndex = paperSizeKeys.indexOf(this.paperSize);
+      const nextIndex = ((currentIndex >= 0 ? currentIndex : 0) + 1) % paperSizeKeys.length;
+      this.paperSize = paperSizeKeys[nextIndex];
+      this.paperSizeBtn.textContent = (PAPER_SIZES[this.paperSize] || PAPER_SIZES.letter).label;
       this.settings.paperSize = this.paperSize;
       this.saveSettings();
       this.applyStyles();
@@ -1995,10 +2294,11 @@ class CompositionModePlugin extends Plugin {
     exitBtn.textContent = 'Exit';
     exitBtn.addEventListener('click', () => this.deactivate());
 
-    this.controlBar.append(zoomGroup, paperSizeGroup, pagesGroup, sideMarginGroup, topMarginGroup, fadeGroup, wordCountEl, exitBtn);
+    this.controlBar.append(zoomGroup, typeGroup, paperSizeGroup, pagesGroup, sideMarginGroup, topMarginGroup, fadeGroup, wordCountEl, exitBtn);
     document.body.appendChild(this.controlBar);
 
     this.updateZoomDisplay();
+    this.updateTypeDisplay();
 
     this.wordCountInterval = setInterval(() => {
       if (this.isActive) this.updateWordCount();
@@ -2049,6 +2349,14 @@ class CompositionModePlugin extends Plugin {
     }
   }
 
+  updateTypeDisplay() {
+    if (this.typeDisplay) {
+      const fontSizePt = this.clampFontSizePt(this.settings.fontSizePt);
+      const label = Number.isInteger(fontSizePt) ? `${fontSizePt}` : `${fontSizePt.toFixed(1)}`;
+      this.typeDisplay.textContent = `${label} pt`;
+    }
+  }
+
   zoomBy(delta) {
     if (!this.isActive) return;
     this.currentZoom = this.clampZoom((this.currentZoom || 1) + delta);
@@ -2062,6 +2370,14 @@ class CompositionModePlugin extends Plugin {
 
   zoomOut() {
     this.zoomBy(-0.1);
+  }
+
+  typeSizeBy(delta) {
+    if (!this.isActive) return;
+    this.settings.fontSizePt = this.clampFontSizePt((this.settings.fontSizePt ?? DEFAULT_SETTINGS.fontSizePt) + delta);
+    this.updateTypeDisplay();
+    this.applyStyles();
+    this.saveSettings();
   }
 
   setupZoomHandlers() {
@@ -2130,8 +2446,12 @@ class CompositionModeSettingTab extends PluginSettingTab {
       .setName('Paper size')
       .setDesc('Default paper size for page surface')
       .addDropdown(d => d
-        .addOption('letter', 'Letter (8.5 x 11)')
-        .addOption('a4', 'A4 (210 x 297mm)')
+        .addOptions(Object.fromEntries(
+          Object.entries(PAPER_SIZES).map(([key, def]) => [
+            key,
+            `${def.label} (${def.width} × ${def.height} in)`
+          ])
+        ))
         .setValue(this.plugin.settings.paperSize)
         .onChange(async (v) => {
           this.plugin.settings.paperSize = v;
@@ -2140,7 +2460,7 @@ class CompositionModeSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Show page breaks')
-      .setDesc('Insert visible gray gaps between pages at paragraph boundaries')
+      .setDesc('Insert visible gray gaps between pages; long prose paragraphs can split at word boundaries')
       .addToggle(t => t
         .setValue(this.plugin.settings.showPageBreaks)
         .onChange(async (v) => {
@@ -2150,7 +2470,7 @@ class CompositionModeSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Words per page')
-      .setDesc('Target word-count per page. Breaks snap to the nearest paragraph boundary above this threshold. 400 is typical for a Letter/A4 manuscript page.')
+      .setDesc('Legacy target used by older pagination. Current page breaks are based on paper size, margins, type size, and measured text height.')
       .addSlider(s => s
         .setLimits(150, 800, 25)
         .setValue(this.plugin.settings.pageWordCount)
@@ -2197,8 +2517,21 @@ class CompositionModeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName('Type size (points)')
+      .setDesc('Body text size in typographic points. Typical manuscript text is 12 pt; printed book interiors often land around 10–11 pt.')
+      .addSlider(s => s
+        .setLimits(MIN_FONT_SIZE_PT, MAX_FONT_SIZE_PT, 0.5)
+        .setValue(this.plugin.settings.fontSizePt ?? DEFAULT_SETTINGS.fontSizePt)
+        .setDynamicTooltip()
+        .onChange(async (v) => {
+          this.plugin.settings.fontSizePt = this.plugin.clampFontSizePt(v);
+          await this.plugin.saveSettings();
+          if (this.plugin.isActive) this.plugin.applyStyles();
+        }));
+
+    new Setting(containerEl)
       .setName('Side margin (inches)')
-      .setDesc('Left/right margin between paper edge and text column. Typical manuscript: 1.0–1.5in. Narrower feels like a magazine column; wider feels like a book.')
+      .setDesc('Left/right margin between paper edge and text column. On small book trims, the plugin caps this to preserve a readable text block.')
       .addSlider(s => s
         .setLimits(0.5, 2.5, 0.05)
         .setValue(this.plugin.settings.pageMarginXIn ?? 1.25)
@@ -2210,7 +2543,7 @@ class CompositionModeSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Top/bottom margin (inches)')
-      .setDesc('Vertical margin above and below the text on each page. Typical: 0.75–1.25in.')
+      .setDesc('Vertical margin above and below the text on each page. On small book trims, the plugin caps this to preserve usable page depth.')
       .addSlider(s => s
         .setLimits(0.5, 2.0, 0.05)
         .setValue(this.plugin.settings.pageMarginYIn ?? 1.0)

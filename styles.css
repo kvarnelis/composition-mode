@@ -139,8 +139,13 @@ body.composition-mode-active .markdown-source-view.mod-cm6 .cm-contentContainer 
   position: relative !important;
 }
 
-/* Hide gutters/line numbers to feel more like a page */
-body.composition-mode-active .cm-gutters {
+/* Hide line numbers but preserve paragraph-numbers plugin gutter if present */
+body.composition-mode-active .cm-lineNumbers {
+  display: none !important;
+}
+
+/* Show gutters container only if paragraph-numbers plugin is active */
+body.composition-mode-active .cm-gutters:not(:has(.cm-paragraph-number)) {
   display: none !important;
 }
 
@@ -340,7 +345,8 @@ body.composition-mode-active .modal-container {
   flex: 0 0 auto;
 }
 
-.composition-mode-zoom-display {
+.composition-mode-zoom-display,
+.composition-mode-type-display {
   color: rgba(255, 255, 255, 0.6);
   font-variant-numeric: tabular-nums;
   min-width: 40px;

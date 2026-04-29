@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.4 — 2026-04-29
+
+- **Book page sizes**: added Trade 6 × 9 and Academic 7 × 10 alongside Letter and A4, ordered from smaller to larger. Removed Digest because the narrow trim produced unreliable drafting pages.
+- **Point-size type controls** in settings, commands, and the bottom control bar.
+- **Mid-paragraph pagination** for long prose paragraphs, splitting at word boundaries so book-sized pages do not leave large blank areas.
+- **CSS-inch page geometry** with small-trim margin caps to keep text blocks readable.
+- **README updates** documenting page sizes, point-size type, manual page breaks, and pagination limits.
+
 ## 1.1.2 — 2026-04-22
 
 - **Exit button** in the control bar for quick escape from composition mode.
