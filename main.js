@@ -1704,7 +1704,7 @@ class CompositionModePlugin extends Plugin {
     // zoom factor when compared with layout-space measurements.
 
     this.styleEl.textContent = `
-      body.composition-mode-active .workspace-leaf-content {
+      body.composition-mode-active .workspace-leaf-content[data-type="markdown"] {
         width: ${paperWidthCss} !important;
         min-width: min(160px, calc(100vw - 6rem)) !important;
         max-width: min(calc(100vw - 6rem), ${Math.max(400, this.settings.maxPaperWidthPx || 1400)}px) !important;
@@ -1712,24 +1712,24 @@ class CompositionModePlugin extends Plugin {
         background: var(--background-primary) !important;
         zoom: ${visualZoom};
       }
-      body.composition-mode-active .cm-editor {
+      body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-editor {
         --composition-mode-page-margin-x: ${effectiveMarginXIn}in;
         --composition-mode-page-margin-y-px: ${effectiveMarginYIn}in;
       }
-      body.composition-mode-active .markdown-source-view.mod-cm6,
-      body.composition-mode-active .cm-editor,
-      body.composition-mode-active .cm-contentContainer,
-      body.composition-mode-active .cm-content {
+      body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .markdown-source-view.mod-cm6,
+      body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-editor,
+      body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-contentContainer,
+      body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-content {
         background: transparent !important;
       }
-      body.composition-mode-active .markdown-source-view.mod-cm6 {
+      body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .markdown-source-view.mod-cm6 {
         font-size: ${effectiveFontSizePt}pt;
       }
-      body.composition-mode-active .cm-content {
+      body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-content {
         font-size: inherit;
       }
-      body.composition-mode-active .internal-embed.image-embed,
-      body.composition-mode-active .cm-content .image-embed {
+      body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .internal-embed.image-embed,
+      body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-content .image-embed {
         width: ${Math.max(20, Math.min(100, this.settings.imageWidthPct || 100))}% !important;
         max-width: ${Math.max(20, Math.min(100, this.settings.imageWidthPct || 100))}% !important;
         margin-left: auto !important;

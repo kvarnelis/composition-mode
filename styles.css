@@ -35,7 +35,7 @@ body.composition-mode-active .workspace-leaf {
 }
 
 /* ===== Paper (the leaf content) ===== */
-body.composition-mode-active .workspace-leaf-content {
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] {
   --line-width: 100%;
   --file-line-width: 100%;
   --max-width: 100%;
@@ -49,7 +49,7 @@ body.composition-mode-active .workspace-leaf-content {
 }
 
 /* Page margin variables live on cm-editor for reference */
-body.composition-mode-active .cm-editor {
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-editor {
   /* Match a more word-processor-like default: 1.25in margins. */
   --composition-mode-page-margin-x: 1.25in;
   /* Give pages a real top/bottom margin too; 2rem looked visibly cramped. */
@@ -61,8 +61,8 @@ body.composition-mode-active .cm-editor {
    Obsidian's inline title and Properties UI sit above that content and are
    not part of the pagination math, which makes the first page look wrong.
    Hide them entirely so the first visible page starts with the note body. */
-body.composition-mode-active .inline-title,
-body.composition-mode-active .metadata-container {
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .inline-title,
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .metadata-container {
   display: none !important;
 }
 
@@ -73,11 +73,11 @@ body.composition-mode-active .metadata-container {
    stops short of the paper's edge — leaving white slivers on either
    side. Obsidian and many themes add small paddings to .view-content
    and .markdown-source-view by default, so we override aggressively. */
-body.composition-mode-active .view-content,
-body.composition-mode-active .view-content > div,
-body.composition-mode-active .markdown-source-view,
-body.composition-mode-active .markdown-source-view.mod-cm6,
-body.composition-mode-active .cm-editor {
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .view-content,
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .view-content > div,
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .markdown-source-view,
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .markdown-source-view.mod-cm6,
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-editor {
   padding: 0 !important;
   margin: 0 !important;
   width: 100% !important;
@@ -140,12 +140,12 @@ body.composition-mode-active .markdown-source-view.mod-cm6 .cm-contentContainer 
 }
 
 /* Hide line numbers but preserve paragraph-numbers plugin gutter if present */
-body.composition-mode-active .cm-lineNumbers {
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-lineNumbers {
   display: none !important;
 }
 
 /* Show gutters container only if paragraph-numbers plugin is active */
-body.composition-mode-active .cm-gutters:not(:has(.cm-paragraph-number)) {
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-gutters:not(:has(.cm-paragraph-number)) {
   display: none !important;
 }
 
@@ -194,8 +194,8 @@ body.composition-mode-active .cm-gutters:not(:has(.cm-paragraph-number)) {
    is the paper column). Universal selector is intentional: any image
    anywhere in the composition-mode workspace should fit the column. UI
    chrome images are hidden by other composition-mode rules. */
-body.composition-mode-active img,
-body.composition-mode-active video {
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] img,
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] video {
   max-width: 100% !important;
   width: auto !important;
   height: auto !important;
@@ -208,16 +208,16 @@ body.composition-mode-active video {
    external monitors where the column is wide). Forcing the wrapper to
    block-level with width:100% + an explicit width on the nested img
    stretches every image embed to fill the text column. */
-body.composition-mode-active .internal-embed,
-body.composition-mode-active .internal-embed.image-embed {
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .internal-embed,
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .internal-embed.image-embed {
   display: block !important;
   width: 100% !important;
   max-width: 100% !important;
   vertical-align: middle;
 }
 
-body.composition-mode-active .internal-embed.image-embed img,
-body.composition-mode-active .cm-content .image-embed img {
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .internal-embed.image-embed img,
+body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-content .image-embed img {
   width: 100% !important;
   max-width: 100% !important;
   height: auto !important;

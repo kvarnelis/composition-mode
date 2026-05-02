@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.5 — 2026-05-02
+
+- Fixed Composition Mode applying paper width, zoom, editor padding, image, and gutter rules to non-Markdown panes such as Claudian. These rules are now scoped to Markdown leaf content only, preventing sidebars from being clipped when Composition Mode is active.
+
 ## 1.1.4 — 2026-04-29
 
 - **Book page sizes**: added Trade 6 × 9 and Academic 7 × 10 alongside Letter and A4, ordered from smaller to larger. Removed Digest because the narrow trim produced unreliable drafting pages.
