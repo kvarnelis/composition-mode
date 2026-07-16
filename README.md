@@ -70,7 +70,7 @@ or:
 
 ## Use
 
-- Open a note and toggle **Composition Mode** from the command palette, or bind a hotkey.
+- Open a note and toggle **Composition Mode** from the command palette or with `Mod` + `Shift` + `C`.
 - A control bar appears on mouseover at the bottom edge: zoom, type size, paper size, page breaks, side/top margins, background, and word count.
 - Exit via the **Exit** button in the control bar, or press Escape.
 

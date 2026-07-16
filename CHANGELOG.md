@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.6 — 2026-07-16
+
+- Added `Mod` + `Shift` + `C` as the default shortcut for toggling Composition Mode.
+
 ## 1.1.5 — 2026-05-02
 
 - Fixed Composition Mode applying paper width, zoom, editor padding, image, and gutter rules to non-Markdown panes such as Claudian. These rules are now scoped to Markdown leaf content only, preventing sidebars from being clipped when Composition Mode is active.

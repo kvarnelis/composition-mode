@@ -1095,7 +1095,8 @@ class CompositionModePlugin extends Plugin {
     this.addCommand({
       id: 'toggle-composition-mode',
       name: 'Toggle Composition Mode',
-      callback: () => this.toggle()
+      callback: () => this.toggle(),
+      hotkeys: [{ modifiers: ['Mod', 'Shift'], key: 'C' }]
     });
 
     this.addCommand({
