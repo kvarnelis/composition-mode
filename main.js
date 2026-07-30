@@ -14,6 +14,7 @@ const DEFAULT_SETTINGS = {
   showPageBreaks: true,
   pageGapHeight: 60,
   pageWordCount: 400,
+  showStatusBar: true,
   debugMode: false,
   zoomLevels: {}
 };
@@ -65,8 +66,8 @@ function setDebugModeEnabled(value) {
 //     under-count.
 //   - Image heights are exact for every cached file (derived from natural
 //     dimensions + contentWidth). Images whose Image() preload is still
-//     in flight contribute 0 height for the current pass; the preload's
-//     load event schedules another rebuild with correct dimensions.
+//     in flight use a capped placeholder; the preload's load event schedules
+//     another rebuild with correct dimensions.
 //   - Canvas measureText divides total text width by content width;
 //     this can be off by 0-1 visual line vs. true word-wrap. Sub-1%
 //     drift at typical paragraph sizes.
@@ -82,12 +83,15 @@ const pageBreakConfig = {
   lineHeight: 24,            // px; from .cm-line computed line-height
   contentWidth: 0,           // px; from .cm-content.clientWidth
   fontSpec: '400 16px sans-serif', // canvas font shorthand from .cm-line
+  imageWidthPct: 100,         // rendered image width as a percentage of the column
+  pageContentHeight: 0,       // px; pageHeight minus top and bottom page margins
+  pageCount: 1,               // status-bar snapshot from the latest active rebuild
+  pageTopBoundaries: [0],     // cumulative layout-space top of each physical page
+  imageAspectRatioMap: new Map(), // Map<image key, natural height / width>
   imageHeightMap: new Map(), // Map<filename, displayedHeight px>; rebuilt on
                              //   every triggerEditors() from the plugin's
-                             //   natural-dims cache. No fallback — every
-                             //   image in the doc is a known file with
-                             //   deterministic natural dimensions, so
-                             //   heights are always computed exactly.
+                             //   natural-dims cache. Missing entries use a
+                             //   capped placeholder until preload completes.
   normalizeForLivePreview: false, // true when the active CM6 editor is Live
                                   // Preview, where markdown syntax such as
                                   // link destinations is hidden from layout.
@@ -98,6 +102,18 @@ const pageBreakConfig = {
   headingScale: 1.3,         // multiplier on lineHeight for h1-h3
   _v: 0
 };
+
+// Image discovery is initiated from both metric refreshes and document edits.
+// The StateField cannot own plugin async work, so docChanged merely queues a
+// module-level callback; the plugin instance performs resolution after the
+// transaction has finished dispatching.
+const imageKeysByEditorState = new WeakMap();
+const paginationStatusByEditorState = new WeakMap();
+let imageDiscoveryScheduler = null;
+let zeroMetricRetryScheduler = null;
+let zeroMetricRetrySucceeded = null;
+let paginationStatusScheduler = null;
+let statusDocChangeScheduler = null;
 
 // Single-line-per-rebuild debug log. Spam-proof: no tight-loop writes.
 async function dbg(msg) {
@@ -144,15 +160,41 @@ function isImageLine(text) {
   return /^!\[\[.+?\]\]/.test(t) || /^!\[.*?\]\(.+?\)/.test(t);
 }
 
+function normalizeImagePathKey(value) {
+  if (!value || typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (/^data:/i.test(trimmed)) return trimmed.toLowerCase();
+  if (/^https?:/i.test(trimmed)) return basenameFromUrlish(trimmed);
+
+  const withoutQuery = trimmed.split('?')[0].split('#')[0];
+  let decoded = withoutQuery;
+  try {
+    decoded = decodeURIComponent(withoutQuery);
+  } catch (e) {
+    // A malformed escape should not make the entire image undiscoverable.
+  }
+  const normalized = decoded.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\//, '');
+  return normalized.toLowerCase() || null;
+}
+
+function extractMarkdownImageTarget(text) {
+  if (!text) return null;
+  const t = text.trim();
+  const bracketed = /^!\[[^\]]*\]\(\s*<([^>]+)>/.exec(t);
+  if (bracketed) return bracketed[1].trim() || null;
+
+  const unbracketed = /^!\[[^\]]*\]\(\s*([\s\S]*?)\s*\)$/.exec(t);
+  if (!unbracketed) return null;
+  const withoutTitle = unbracketed[1].replace(/\s+"[^"]*"\s*$/, '').trim();
+  return withoutTitle || null;
+}
+
 // Extract a stable lookup key for an image embed line. Supports both
 // Obsidian wikilink syntax (![[file.png]], ![[folder/file.png|alias]],
 // ![[file.png#heading]]) and standard markdown (![alt](path/to/file.png)).
-// Returns the basename lowercased — matching the `basename` stored in
-// imageDimsCache so estimateParagraphHeight can look up the height for
-// this image line from the plugin's natural-dimensions cache.
-// Filename collisions across folders are possible in theory but rare in
-// practice; an Obsidian wikilink with just a filename already assumes
-// the name is unique in the vault.
+// Folder-qualified local references retain their full lowercase vault path;
+// plain references and external URLs use a lowercase basename.
 function extractImageKey(text) {
   if (!text) return null;
   const t = text.trim();
@@ -160,22 +202,12 @@ function extractImageKey(text) {
   // ![[file.png]] / ![[folder/file.png|alias]] / ![[file.png#heading]]
   let m = /^!\[\[([^\]|#]+?)(?:[|#][^\]]*)?\]\]/.exec(t);
   if (m) {
-    const base = m[1].trim().split('/').pop();
-    return (base || '').toLowerCase() || null;
+    return normalizeImagePathKey(m[1]);
   }
 
   // ![alt](path/to/file.png) / ![alt](<path with spaces.png> "title")
-  m = /^!\[[^\]]*\]\(\s*<?([^\s)>]+)>?/.exec(t);
-  if (m) {
-    const raw = m[1];
-    let base;
-    try {
-      base = decodeURIComponent(raw.split('/').pop().split('?')[0].split('#')[0]);
-    } catch (e) {
-      base = raw.split('/').pop();
-    }
-    return (base || '').toLowerCase() || null;
-  }
+  const target = extractMarkdownImageTarget(t);
+  if (target) return normalizeImagePathKey(target);
 
   return null;
 }
@@ -194,6 +226,83 @@ function basenameFromUrlish(value) {
   }
 }
 
+function collectImageReferences(text) {
+  const refs = [];
+  if (!text) return refs;
+
+  const reWiki = /!\[\[([^\]|#\n]+)(?:[|#][^\]\n]*)?\]\]/g;
+  let m;
+  while ((m = reWiki.exec(text)) !== null) {
+    const linkpath = m[1].trim();
+    const key = extractImageKey(m[0]);
+    if (linkpath && key) refs.push({ key, linkpath, src: null });
+  }
+
+  const reMd = /!\[[^\]]*\]\(\s*(?:<[^>\n]+>|[^)\n]+)\s*\)/g;
+  while ((m = reMd.exec(text)) !== null) {
+    const raw = extractMarkdownImageTarget(m[0]);
+    const key = extractImageKey(m[0]);
+    if (!raw || !key) continue;
+    let decoded = raw;
+    try {
+      decoded = decodeURIComponent(raw);
+    } catch (e) {
+      // Keep the original path when percent decoding is malformed; Obsidian
+      // may still be able to resolve it, and external URLs remain usable.
+    }
+    const external = /^(?:https?:|data:)/i.test(raw);
+    refs.push({ key, linkpath: external ? null : decoded, src: external ? raw : null });
+  }
+
+  return refs;
+}
+
+function extractImageWidthOverride(text) {
+  if (!text) return null;
+  const match = /!\[\[[^\]]*\|(\d+(?:\.\d+)?)(?:x\d+(?:\.\d+)?)?\]\]/.exec(text);
+  if (!match) return null;
+  const width = Number(match[1]);
+  return Number.isFinite(width) && width > 0 ? width : null;
+}
+
+function rememberImageKeysForState(state) {
+  const refs = collectImageReferences(state?.doc?.toString?.() || '');
+  const keys = new Set(refs.map(ref => ref.key));
+  if (state) imageKeysByEditorState.set(state, keys);
+  return keys;
+}
+
+function scheduleUnknownImageDiscovery(tr) {
+  if (!tr?.state) return;
+  const docText = tr.state.doc.toString();
+  const refs = collectImageReferences(docText);
+  const currentKeys = new Set(refs.map(ref => ref.key));
+  const previousKeys = imageKeysByEditorState.get(tr.startState) || new Set();
+  imageKeysByEditorState.set(tr.state, currentKeys);
+  const scheduler = imageDiscoveryScheduler;
+  if (!refs.length || typeof scheduler !== 'function') return;
+
+  const introducedKeys = new Set();
+  const introducedRefs = refs.filter(ref => {
+    if (previousKeys.has(ref.key) || introducedKeys.has(ref.key)) return false;
+    introducedKeys.add(ref.key);
+    return true;
+  });
+  if (!introducedRefs.length) return;
+
+  // Carry the references found by this one edit-time scan into the async
+  // plugin callback. If the callback can no longer associate this text with
+  // the active note, deleting the new state's entry lets the next transaction
+  // treat its references as newly introduced and retry safely.
+  const retry = () => imageKeysByEditorState.delete(tr.state);
+  setTimeout(() => scheduler({
+    docText,
+    refs: introducedRefs,
+    state: tr.state,
+    retry
+  }), 0);
+}
+
 // Whether the entire line (ignoring leading/trailing whitespace) is a
 // single image embed and nothing else. This is the stricter variant of
 // isImageLine: isImageLine is satisfied by any line that STARTS with an
@@ -204,7 +313,7 @@ function basenameFromUrlish(value) {
 function isPureImageLine(text) {
   const t = text.trim();
   return /^!\[\[[^\]|#]+?(?:[|#][^\]]*)?\]\]$/.test(t) ||
-         /^!\[[^\]]*\]\([^\s)]+\)$/.test(t);
+         /^!\[[^\]]*\]\(\s*(?:<[^>\n]+>|[^)\n]+)\s*\)$/.test(t);
 }
 
 // Detect a manual page-break marker on its own line. Accepts either an
@@ -227,7 +336,7 @@ function isPageBreakMarker(text) {
 // lines skip this path entirely.
 function splitLineIntoImageSegments(text) {
   const segments = [];
-  const re = /!\[\[[^\]|#]+?(?:[|#][^\]]*)?\]\]|!\[[^\]]*\]\([^\s)]+\)/g;
+  const re = /!\[\[[^\]|#]+?(?:[|#][^\]]*)?\]\]|!\[[^\]]*\]\(\s*(?:<[^>\n]+>|[^)\n]+)\s*\)/g;
   let lastIndex = 0;
   let m;
   while ((m = re.exec(text)) !== null) {
@@ -271,6 +380,57 @@ function getFrontmatterEndLine(doc) {
     if (text === '---' || text === '...') return lineNum;
   }
   return 0;
+}
+
+// Pure status-bar helpers. They deliberately know nothing about CodeMirror:
+// tests can pin boundary semantics, and runtime callers can reuse the same
+// whitespace-token definition without waking the paginator.
+function countDocumentWords(text, suppressFrontmatter = false) {
+  let body = typeof text === 'string' ? text : '';
+  if (suppressFrontmatter) {
+    const lines = body.split(/\r?\n/);
+    if (lines.length >= 2 && lines[0].trim() === '---') {
+      const end = lines.slice(1).findIndex(line => {
+        const trimmed = line.trim();
+        return trimmed === '---' || trimmed === '...';
+      });
+      if (end >= 0) body = lines.slice(end + 2).join('\n');
+    }
+  }
+  const trimmed = body.trim();
+  return trimmed ? trimmed.split(/\s+/).length : 0;
+}
+
+function currentPageFromScroll(scrollTop, viewportHeight, pageTopBoundaries) {
+  const tops = Array.isArray(pageTopBoundaries) && pageTopBoundaries.length
+    ? pageTopBoundaries
+    : [0];
+  const top = Number.isFinite(Number(scrollTop)) ? Math.max(0, Number(scrollTop)) : 0;
+  const height = Number.isFinite(Number(viewportHeight)) ? Math.max(0, Number(viewportHeight)) : 0;
+  const eyeY = top + (height * 0.5);
+
+  // Upper-bound search: an eye position exactly on a page top belongs to
+  // that new page, matching what the reader sees at the boundary.
+  let low = 0;
+  let high = tops.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (Number(tops[mid]) <= eyeY) low = mid + 1;
+    else high = mid;
+  }
+  return Math.max(1, Math.min(tops.length, low));
+}
+
+function publishPaginationStatus(state, pageTopBoundaries) {
+  const boundaries = Array.isArray(pageTopBoundaries) && pageTopBoundaries.length
+    ? pageTopBoundaries.slice()
+    : [0];
+  const status = {
+    pageCount: boundaries.length,
+    pageTopBoundaries: boundaries
+  };
+  paginationStatusByEditorState.set(state, status);
+  paginationStatusScheduler?.();
 }
 
 // Live Preview hides significant markdown syntax from visual layout:
@@ -361,25 +521,56 @@ function makeMeasurer(fontSpec, contentWidth) {
   };
 }
 
+function getPageContentHeightCap(cfg) {
+  const configuredCap = Number(cfg.pageContentHeight) || 0;
+  if (configuredCap > 0) return configuredCap;
+  return Math.max(0, (Number(cfg.pageHeight) || 0) - (2 * (Number(cfg.pageMarginY) || 0)));
+}
+
+function getEstimatedImageWidth(cfg, tokenText = '') {
+  const contentWidth = Math.max(0, Number(cfg.contentWidth) || 0);
+  const override = extractImageWidthOverride(tokenText);
+  if (override) return Math.min(contentWidth, override);
+  const pct = Math.max(20, Math.min(100, Number(cfg.imageWidthPct) || 100));
+  return contentWidth * (pct / 100);
+}
+
+function estimateImagePlaceholderHeight(cfg, tokenText = '') {
+  const placeholder = getEstimatedImageWidth(cfg, tokenText) * 0.75;
+  const cap = getPageContentHeightCap(cfg);
+  return cap > 0 ? Math.min(placeholder, cap) : placeholder;
+}
+
 // Px height for a paragraph block. Sums per-source-line heights:
-//   image line  → cfg.imageHeightMap.get(line.imageKey); exact
+//   image line  → cfg.imageHeightMap.get(line.imageKey); exact when loaded
 //                 height derived from the file's natural dimensions
-//                 and current contentWidth. If not yet in the map
-//                 (preload hasn't completed for this file), height
-//                 contributes 0 — pagination will refresh once the
-//                 preload load event fires.
+//                 and current contentWidth. If not yet in the map, a
+//                 conservative 4:3 placeholder prevents zero-height pages;
+//                 pagination refreshes once preload completes.
 //   heading 1-3 → visualLines × lineHeight × cfg.headingScale
 //   default     → visualLines × lineHeight
 function estimateParagraphHeight(block, cfg, measurer) {
   const { lineHeight, headingScale, imageHeightMap } = cfg;
-  const lookupImageHeight = (key) => {
-    if (!key || !imageHeightMap || typeof imageHeightMap.get !== 'function') return 0;
-    return imageHeightMap.get(key) || 0;
+  const lookupImageHeight = (key, tokenText) => {
+    if (key && imageHeightMap && typeof imageHeightMap.get === 'function') {
+      const knownHeight = imageHeightMap.get(key);
+      if (knownHeight > 0) {
+        const override = extractImageWidthOverride(tokenText);
+        const ratio = cfg.imageAspectRatioMap?.get?.(key);
+        if (override && ratio > 0) {
+          const cap = getPageContentHeightCap(cfg);
+          const overrideHeight = getEstimatedImageWidth(cfg, tokenText) * ratio;
+          return cap > 0 ? Math.min(overrideHeight, cap) : overrideHeight;
+        }
+        return knownHeight;
+      }
+    }
+    return estimateImagePlaceholderHeight(cfg, tokenText);
   };
   let height = 0;
   for (const line of block.lines) {
     if (line.isImage) {
-      height += lookupImageHeight(line.imageKey);
+      height += lookupImageHeight(line.imageKey, line.text);
       continue;
     }
     // Mixed text/image line: each inline image embed renders as its own
@@ -394,7 +585,7 @@ function estimateParagraphHeight(block, cfg, measurer) {
     if (line.segments) {
       for (const seg of line.segments) {
         if (seg.type === 'image') {
-          height += lookupImageHeight(seg.imageKey);
+          height += lookupImageHeight(seg.imageKey, seg.text);
           continue;
         }
         const measuredText = normalizeLineForMeasurement(seg.text, cfg);
@@ -424,7 +615,7 @@ function estimateTextHeight(text, headingLevel, cfg, measurer) {
 
 function chooseReadableSplitOffset(text, maxOffset) {
   const safeMax = Math.max(0, Math.min(text.length, maxOffset));
-  const minOffset = Math.min(safeMax, Math.max(40, Math.floor(text.length * 0.05)));
+  const minOffset = Math.min(safeMax, 40);
   if (safeMax <= minOffset) return null;
 
   // Page breaks should behave like physical page bottoms, not like
@@ -446,7 +637,7 @@ function chooseReadableSplitOffset(text, maxOffset) {
 }
 
 function findTextOffsetForVisualLines(text, cfg, maxLines) {
-  if (!text || maxLines < 3 || !cfg.contentWidth || cfg.contentWidth <= 0) return null;
+  if (!text || maxLines < 2 || !cfg.contentWidth || cfg.contentWidth <= 0) return null;
 
   const ctx = getMeasureCtx();
   ctx.font = cfg.fontSpec || '400 16px sans-serif';
@@ -511,29 +702,40 @@ function findMidParagraphSplit(block, cfg, measurer, availableHeight, startOffse
   if (!isSplittableTextBlock(block)) return null;
   const line = block.lines[0];
   const safeStartOffset = Math.max(0, Math.min(line.text.length - 1, startOffset || 0));
-  if (availableHeight < cfg.lineHeight * 3) return null;
+  const linesAvail = Math.floor(availableHeight / cfg.lineHeight);
+  if (linesAvail < 2) return null;
 
-  // Use ceil rather than floor so fractional line-height measurement drift
-  // doesn't leave a conspicuously short final line before the page gap.
-  const maxLines = Math.max(3, Math.ceil(availableHeight / cfg.lineHeight));
+  // A strict floor keeps the before-fragment inside the content boundary.
+  // If measurement drift leaves a little unused space, prefer that honest
+  // early gap to letting a rendered line poke past the page bottom.
   const remainingText = line.text.slice(safeStartOffset);
-  const rawOffset = findTextOffsetForVisualLines(remainingText, cfg, maxLines);
-  const splitOffset = chooseReadableSplitOffset(remainingText, rawOffset || 0);
-  const absoluteSplitOffset = safeStartOffset + (splitOffset || 0);
-  if (!splitOffset || absoluteSplitOffset <= safeStartOffset || absoluteSplitOffset >= line.text.length) return null;
+  const minFragmentHeight = 2 * cfg.lineHeight;
 
-  const beforeText = line.text.slice(safeStartOffset, absoluteSplitOffset);
-  const afterText = line.text.slice(absoluteSplitOffset);
-  const beforeHeight = estimateTextHeight(beforeText, 0, cfg, measurer);
-  const afterHeight = estimateTextHeight(afterText, 0, cfg, measurer);
-  if (beforeHeight <= 0 || afterHeight <= 0 || beforeHeight > availableHeight + cfg.lineHeight) return null;
+  // Pull the break earlier when the first candidate strands a one-line
+  // widow. The loop is bounded by linesAvail and never returns unless the
+  // absolute offset advances beyond the caller's current start offset.
+  for (let maxLines = linesAvail; maxLines >= 2; maxLines--) {
+    const rawOffset = findTextOffsetForVisualLines(remainingText, cfg, maxLines);
+    const splitOffset = chooseReadableSplitOffset(remainingText, rawOffset || 0);
+    const absoluteSplitOffset = safeStartOffset + (splitOffset || 0);
+    if (!splitOffset || absoluteSplitOffset <= safeStartOffset || absoluteSplitOffset >= line.text.length) continue;
 
-  return {
-    pos: line.from + absoluteSplitOffset,
-    splitOffset: absoluteSplitOffset,
-    beforeHeight,
-    afterHeight
-  };
+    const beforeText = line.text.slice(safeStartOffset, absoluteSplitOffset);
+    const afterText = line.text.slice(absoluteSplitOffset);
+    const beforeHeight = estimateTextHeight(beforeText, 0, cfg, measurer);
+    const afterHeight = estimateTextHeight(afterText, 0, cfg, measurer);
+    if (beforeHeight < minFragmentHeight) return null;
+    if (beforeHeight > availableHeight || afterHeight < minFragmentHeight) continue;
+
+    return {
+      pos: line.from + absoluteSplitOffset,
+      splitOffset: absoluteSplitOffset,
+      beforeHeight,
+      afterHeight
+    };
+  }
+
+  return null;
 }
 
 // PageGapWidget renders two nested divs:
@@ -685,7 +887,9 @@ class PageGapWidget extends WidgetType {
           ` src=${fmtRect(sourceView?.getBoundingClientRect?.())}`
         );
         dbg(`bar-mount-chain: ${chain.join(' <- ')}`);
-      } catch (e) {}
+      } catch (e) {
+        dbg(`bar-mount: error=${e?.message || String(e)}`);
+      }
     });
     return outer;
   }
@@ -715,7 +919,10 @@ const rebuildPageBreaks = StateEffect.define();
 // gray bar, top-margin-for-next-page below — visually placing the bar
 // exactly at the page boundary.
 function computePageBreaks(state) {
-  if (!pageBreakConfig.enabled) return Decoration.none;
+  if (!pageBreakConfig.enabled) {
+    publishPaginationStatus(state, [0]);
+    return Decoration.none;
+  }
 
   const cfg = pageBreakConfig;
   const doc = state.doc;
@@ -734,8 +941,11 @@ function computePageBreaks(state) {
   // next applyStyles → triggerEditors with valid metrics.
   if (pageHeight <= 0 || contentWidth <= 0) {
     dbg(`rebuild: skipped (no metrics) pageHeight=${Math.round(pageHeight)} contentWidth=${Math.round(contentWidth)}`);
+    zeroMetricRetryScheduler?.();
+    publishPaginationStatus(state, [0]);
     return Decoration.none;
   }
+  zeroMetricRetrySucceeded?.();
 
   const measurer = makeMeasurer(fontSpec, contentWidth);
 
@@ -890,7 +1100,10 @@ function computePageBreaks(state) {
   }
   if (current) blocks.push(current);
 
-  if (blocks.length === 0) return Decoration.none;
+  if (blocks.length === 0) {
+    publishPaginationStatus(state, [0]);
+    return Decoration.none;
+  }
 
 // Second pass: walk blocks, tracking cumulative y in px from doc top.
 // Insert a page-gap widget BEFORE any block whose addition would overshoot
@@ -913,12 +1126,14 @@ function computePageBreaks(state) {
 // "lost" page breaks entirely.
   const ranges = [];
   const pageContentHeight = Math.max(lineHeight * 3, pageHeight - (2 * pageMarginY));
+  cfg.pageContentHeight = pageContentHeight;
   let pagePhysicalTopY = 0;
   let contentStartY = pagePhysicalTopY + pageMarginY;
   let y = contentStartY;
   let nextPageBoundary = pagePhysicalTopY + pageHeight;
   let contentBoundary = nextPageBoundary - pageMarginY;
   let breakCount = 0;
+  const pageTopBoundaries = [0];
 
   const insertPageBreakAt = (pos, contentEndY) => {
     const unused = Math.max(0, nextPageBoundary - contentEndY);
@@ -934,6 +1149,7 @@ function computePageBreaks(state) {
     breakCount++;
 
     pagePhysicalTopY = Math.max(nextPageBoundary, contentEndY) + barHeight;
+    pageTopBoundaries.push(pagePhysicalTopY);
     contentStartY = pagePhysicalTopY + pageMarginY;
     y = contentStartY;
     nextPageBoundary = pagePhysicalTopY + pageHeight;
@@ -991,15 +1207,16 @@ function computePageBreaks(state) {
         const availableHeight = Math.max(0, contentBoundary - y);
         const split = findMidParagraphSplit(block, cfg, measurer, availableHeight, consumedOffset);
         if (!split) {
-          const heightUsed = y - contentStartY;
-          const pageHasEnough = heightUsed >= pageContentHeight * 0.5;
-          if (i > 0 && pageHasEnough && y > contentStartY) {
+          // Give the remainder a fresh page whenever this page already has
+          // content. On the fresh page y === contentStartY, so a second
+          // failure falls through without creating an infinite break loop.
+          if (y > contentStartY) {
             insertPageBreakAt(line.from + consumedOffset, y);
             continue;
           }
-          // Fallback: if we can't find a safe intra-paragraph word boundary
-          // (very short remaining fragment, pathological long word, etc.),
-          // keep the paragraph visible rather than looping forever.
+          // True last resort: even a fresh page has no safe word-boundary
+          // split (for example, one unbreakable token taller than the page).
+          // Consume the remainder to guarantee termination.
           y += remainingHeight;
           consumedOffset = line.text.length;
           break;
@@ -1026,6 +1243,7 @@ function computePageBreaks(state) {
   }
 
   dbg(`rebuild: blocks=${blocks.length} breaks=${breakCount} targetWords=${targetWords} pageHeight=${Math.round(pageHeight)} contentPageHeight=${Math.round(pageContentHeight)} lineHeight=${Math.round(lineHeight)} contentWidth=${Math.round(contentWidth)} livePreview=${cfg.normalizeForLivePreview ? 'yes' : 'no'} skippedFrontmatterLines=${skippedFrontmatterLines} enabled=${cfg.enabled}`);
+  publishPaginationStatus(state, pageTopBoundaries);
 
   const deco = Decoration.set(ranges, true);
   // Confirm the DecorationSet has what we think it does before handing
@@ -1044,9 +1262,16 @@ function computePageBreaks(state) {
 // = one bar per break.
 const pageBreakField = StateField.define({
   create(state) {
+    rememberImageKeysForState(state);
     return computePageBreaks(state);
   },
   update(value, tr) {
+    if (tr.docChanged) {
+      scheduleUnknownImageDiscovery(tr);
+    } else {
+      const previousKeys = imageKeysByEditorState.get(tr.startState);
+      if (previousKeys) imageKeysByEditorState.set(tr.state, previousKeys);
+    }
     for (const effect of tr.effects) {
       if (effect.is(rebuildPageBreaks)) {
         return computePageBreaks(tr.state);
@@ -1086,6 +1311,33 @@ class CompositionModePlugin extends Plugin {
     // Paths for which an Image() load is in flight — prevents kicking
     // off a second preload for the same file before the first finishes.
     this.pendingImagePreloads = new Set();
+    this.imageWidthObserver = null;
+    this.pendingImageWidthSyncFrame = null;
+    this.currentImageKeyResolutions = new Map();
+    imageDiscoveryScheduler = ({ docText, refs, retry }) => {
+      if (!this.isActive) {
+        retry();
+        return;
+      }
+      const activeView = this.getActiveCompositionElements().activeView;
+      if (!activeView?.file) {
+        retry();
+        return;
+      }
+      // A StateField update can outlive a leaf switch. Never resolve the
+      // captured text relative to a different note's path.
+      if (activeView.editor?.getValue?.() !== docText) {
+        retry();
+        return;
+      }
+      this.preloadImageDimensionsFromText(docText, activeView.file.path, refs);
+    };
+    this.zeroMetricRetryCount = 0;
+    this.pendingZeroMetricRetryFrame = null;
+    zeroMetricRetryScheduler = () => this.scheduleZeroMetricRetry();
+    zeroMetricRetrySucceeded = () => this.resetZeroMetricRetries();
+    paginationStatusScheduler = () => this.scheduleStatusPageUpdate();
+    statusDocChangeScheduler = () => this.scheduleStatusWordCountUpdate();
 
     // Visual debug overlay flag. Keep the machinery available for future
     // debugging, but default it OFF now that full-width page-break rendering
@@ -1128,6 +1380,12 @@ class CompositionModePlugin extends Plugin {
       id: 'decrease-type-size',
       name: 'Decrease Type Size (Composition Mode)',
       callback: () => this.typeSizeBy(-0.5)
+    });
+
+    this.addCommand({
+      id: 'toggle-status-bar',
+      name: 'Toggle status bar',
+      callback: () => this.toggleStatusBar()
     });
 
     // Manual diagnostic trigger — fires logBarDiagnostic() on demand.
@@ -1178,11 +1436,31 @@ class CompositionModePlugin extends Plugin {
       EditorView.decorations.compute([pageBreakField], state => {
         const v = state.field(pageBreakField, false);
         return v || Decoration.none;
+      }),
+      EditorView.updateListener.of(update => {
+        if (update.docChanged) statusDocChangeScheduler?.();
       })
     ]);
+
+    this.registerEvent(this.app.workspace.on('active-leaf-change', () => {
+      if (!this.isActive) return;
+      this.startEditingToolbarHostBridge();
+      this.scheduleEditorPaneBoundsUpdate();
+      if (!this.settings.showStatusBar) return;
+      this.setupStatusBarListeners();
+      this.scheduleStatusWordCountUpdate(0);
+      this.scheduleStatusPageUpdate();
+    }));
   }
 
   onunload() {
+    imageDiscoveryScheduler = null;
+    this.stopImageWidthObserver();
+    zeroMetricRetryScheduler = null;
+    zeroMetricRetrySucceeded = null;
+    paginationStatusScheduler = null;
+    statusDocChangeScheduler = null;
+    this.resetZeroMetricRetries();
     if (this.isActive) this.deactivate();
   }
 
@@ -1408,17 +1686,23 @@ class CompositionModePlugin extends Plugin {
     // Escape via Obsidian's Scope API
     this.escapeScope = new Scope(this.app.scope);
     this.escapeScope.register([], 'Escape', () => {
+      // The status-bar settings panel is a transient layer, so Escape dismisses
+      // it before Escape resumes its usual Composition Mode exit behavior.
+      if (this.statusPopover && !this.statusPopover.hidden) {
+        this.closeStatusPopover();
+        return false;
+      }
       this.deactivate();
       return false;
     });
     this.app.keymap.pushScope(this.escapeScope);
 
     document.body.classList.add('composition-mode-active');
+    this.startEditingToolbarHostBridge();
     this.applyDebugOverlay();
     this.createBackdrop();
     this.injectStyleEl();
-    this.createControlBar();
-    this.createHoverZone();
+    this.applyStatusBarVisibility();
     this.setupZoomHandlers();
     this.setupResizeHandler();
     this.applyStyles();
@@ -1438,13 +1722,18 @@ class CompositionModePlugin extends Plugin {
       this.escapeScope = null;
     }
 
+    // Editing Toolbar rebuilds its DOM on leaf/layout changes. Stop watching
+    // before restoring the third-party hosts or our own restoration mutations
+    // would immediately move them back into the workspace strip.
+    this.stopEditingToolbarHostBridge();
+
     document.body.classList.remove('composition-mode-active');
     document.body.classList.remove('composition-debug-overlay');
 
     if (this.backdrop) { this.backdrop.remove(); this.backdrop = null; }
     if (this.styleEl) { this.styleEl.remove(); this.styleEl = null; }
-    if (this.controlBar) { this.controlBar.remove(); this.controlBar = null; }
-    if (this.hoverZone) { this.hoverZone.remove(); this.hoverZone = null; }
+    this.destroyStatusBar();
+    this.stopEditorPaneBoundsTracking();
 
     if (this.zoomHandler) {
       document.removeEventListener('wheel', this.zoomHandler, true);
@@ -1458,21 +1747,265 @@ class CompositionModePlugin extends Plugin {
       document.removeEventListener('gesturechange', this.gestureHandler, true);
       this.gestureHandler = null;
     }
-    if (this.wordCountInterval) {
-      clearInterval(this.wordCountInterval);
-      this.wordCountInterval = null;
-    }
     if (this.resizeHandler) {
       window.removeEventListener('resize', this.resizeHandler);
+      this.app.workspace.off('resize', this.resizeHandler);
       this.resizeHandler = null;
     }
     if (this.pendingMetricsFrame) {
       cancelAnimationFrame(this.pendingMetricsFrame);
       this.pendingMetricsFrame = null;
     }
+    this.stopImageWidthObserver();
+    this.resetZeroMetricRetries();
   }
 
   // --- UI ---
+
+  // Editing Toolbar's top-style builder may insert into the active view, while
+  // `appendMethod: workspace` inserts directly into .mod-vertical.mod-root.
+  // Neither location is safe for Composition Mode: the view is paper-width /
+  // zoom constrained, and the root split lays direct children out as columns.
+  // Temporarily lift only the known hosts into our fixed, out-of-flow strip.
+  //
+  // Editing Toolbar regenerates its controls after leaf, layout, and resize
+  // events. Observe those insertions and make the accommodation idempotent.
+  // Exact parent/sibling positions are retained so leaving Composition Mode
+  // restores third-party DOM ownership without changing its saved settings.
+  startEditingToolbarHostBridge() {
+    this.stopEditingToolbarHostBridge();
+    const enabledPlugins = this.app.plugins?.enabledPlugins;
+    if (enabledPlugins?.has && !enabledPlugins.has('editing-toolbar')) return;
+    this.editingToolbarOriginalHosts = new Map();
+
+    const relocate = () => {
+      if (!this.isActive) return;
+      const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+      const viewContainer = activeView?.containerEl || null;
+      // A top-style Editing Toolbar belongs to an active editor. In
+      // particular, do not adopt a workspace-level host while a sidebar or
+      // another non-markdown leaf is active.
+      if (!viewContainer) {
+        this.destroyEditingToolbarStrip();
+        return;
+      }
+      const hostDocument = viewContainer?.ownerDocument || document;
+      const workspaceRoot =
+        viewContainer?.closest?.('.mod-vertical.mod-root') ||
+        hostDocument.body?.querySelector('.mod-vertical.mod-root');
+      if (!workspaceRoot) return;
+
+      const selector = [
+        '#editingToolbarModalBar[data-toolbar-style="top"]',
+        '#editingToolbarPopoverBar[data-toolbar-style="top"]',
+        '.editingToolbarModalBar[data-toolbar-style="top"]',
+        '.editingToolbarPopoverBar[data-toolbar-style="top"]'
+      ].join(', ');
+
+      // The top toolbar is either inside the active view or a direct child of
+      // that view's root split. Do not capture toolbar instances belonging to
+      // another root/floating window.
+      const candidates = new Set([
+        ...(viewContainer?.querySelectorAll(selector) || []),
+        ...workspaceRoot.querySelectorAll(`:scope > ${selector.replaceAll(', ', ', :scope > ')}`),
+        ...(this.editingToolbarStrip?.querySelectorAll(selector) || [])
+      ]);
+      if (!candidates.size) {
+        this.destroyEditingToolbarStrip();
+        return;
+      }
+
+      const strip = this.createEditingToolbarStrip(hostDocument, viewContainer);
+      if (!strip) return;
+
+      for (const host of candidates) {
+        if (host.parentElement === strip) continue;
+        if (!this.editingToolbarOriginalHosts.has(host)) {
+          this.editingToolbarOriginalHosts.set(host, {
+            parent: host.parentNode,
+            nextSibling: host.nextSibling
+          });
+        }
+        strip.appendChild(host);
+      }
+      this.measureEditingToolbarStrip();
+    };
+
+    relocate();
+    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!activeView?.containerEl) return;
+    this.editingToolbarHostObserver = new MutationObserver(relocate);
+    const hostBody = activeView?.containerEl?.ownerDocument?.body || document.body;
+    this.editingToolbarHostObserver.observe(hostBody, {
+      childList: true,
+      subtree: true
+    });
+  }
+
+  stopEditingToolbarHostBridge() {
+    if (this.editingToolbarHostObserver) {
+      this.editingToolbarHostObserver.disconnect();
+      this.editingToolbarHostObserver = null;
+    }
+
+    if (this.editingToolbarOriginalHosts) {
+      for (const [host, origin] of this.editingToolbarOriginalHosts) {
+        if (!host.isConnected || !origin.parent?.isConnected) continue;
+        if (origin.nextSibling?.parentNode === origin.parent) {
+          origin.parent.insertBefore(host, origin.nextSibling);
+        } else if (origin.nextSibling === null) {
+          origin.parent.appendChild(host);
+        } else {
+          origin.parent.insertBefore(host, origin.parent.firstChild);
+        }
+      }
+      this.editingToolbarOriginalHosts.clear();
+      this.editingToolbarOriginalHosts = null;
+    }
+
+    this.destroyEditingToolbarStrip();
+  }
+
+  createEditingToolbarStrip(hostDocument, viewContainer) {
+    if (this.editingToolbarStrip?.isConnected) return this.editingToolbarStrip;
+
+    const appContainer =
+      viewContainer?.closest?.('.app-container') ||
+      hostDocument.body?.querySelector('.app-container') ||
+      hostDocument.body;
+    if (!appContainer) return null;
+
+    const strip = hostDocument.createElement('div');
+    strip.className = 'composition-mode-toolbar-strip';
+    strip.setAttribute('role', 'toolbar');
+    strip.setAttribute('aria-label', 'Editing toolbar');
+    appContainer.appendChild(strip);
+    this.editingToolbarStrip = strip;
+
+    // Reserving exactly the rendered strip height prevents the fixed controls
+    // from covering note content. It only shortens the workspace viewport:
+    // paper width/centering and page-break measurements remain unchanged.
+    const ResizeObserverCtor = hostDocument.defaultView?.ResizeObserver;
+    if (ResizeObserverCtor) {
+      this.editingToolbarStripResizeObserver = new ResizeObserverCtor(() => {
+        this.measureEditingToolbarStrip();
+      });
+      this.editingToolbarStripResizeObserver.observe(strip);
+    }
+    hostDocument.body?.classList.add('composition-mode-toolbar-strip-visible');
+    this.updateEditorPaneBounds();
+    return strip;
+  }
+
+  measureEditingToolbarStrip() {
+    const strip = this.editingToolbarStrip;
+    if (!strip?.isConnected) return;
+    // Constrain first: toolbar wrapping (and therefore its reserved height)
+    // depends on the active markdown leaf's width.
+    this.updateEditorPaneBounds();
+    const height = Math.max(0, Math.ceil(strip.getBoundingClientRect().height || strip.offsetHeight || 0));
+    if (height === this.editingToolbarStripHeight) return;
+    this.editingToolbarStripHeight = height;
+    strip.ownerDocument.documentElement.style.setProperty(
+      '--composition-mode-toolbar-strip-height',
+      `${height}px`
+    );
+    // Page breaks use fixed paper metrics, not viewport height. The status
+    // page indicator does use the viewport-center bias, so refresh that cheap
+    // read whenever the reserved strip changes the scroller's clientHeight.
+    this.scheduleStatusPageUpdate();
+  }
+
+  destroyEditingToolbarStrip() {
+    this.editingToolbarStripResizeObserver?.disconnect();
+    this.editingToolbarStripResizeObserver = null;
+
+    const strip = this.editingToolbarStrip;
+    const hostDocument = strip?.ownerDocument || document;
+    if (strip) strip.remove();
+    this.editingToolbarStrip = null;
+    this.editingToolbarStripHeight = 0;
+    hostDocument.body?.classList.remove('composition-mode-toolbar-strip-visible');
+    hostDocument.documentElement?.style.removeProperty('--composition-mode-toolbar-strip-height');
+  }
+
+  getActiveMarkdownLeafElement() {
+    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const viewContainer = activeView?.containerEl || null;
+    return viewContainer?.closest?.('.workspace-leaf') || viewContainer;
+  }
+
+  updateEditorPaneBounds() {
+    if (!this.isActive) return;
+    const leaf = this.getActiveMarkdownLeafElement();
+    const targets = [
+      this.editingToolbarStrip,
+      this.controlBar,
+      this.hoverZone
+    ].filter(Boolean);
+
+    if (leaf !== this.editorPaneBoundsLeaf) {
+      this.editorPaneBoundsLeaf?.classList?.remove('composition-mode-editor-pane');
+      this.editorPaneBoundsResizeObserver?.disconnect();
+      this.editorPaneBoundsResizeObserver = null;
+      this.editorPaneBoundsLeaf = leaf?.isConnected ? leaf : null;
+      this.editorPaneBoundsLeaf?.classList?.add('composition-mode-editor-pane');
+      const ResizeObserverCtor = leaf?.ownerDocument?.defaultView?.ResizeObserver;
+      if (leaf?.isConnected && ResizeObserverCtor) {
+        this.editorPaneBoundsResizeObserver = new ResizeObserverCtor(() => {
+          this.scheduleEditorPaneBoundsUpdate();
+        });
+        this.editorPaneBoundsResizeObserver.observe(leaf);
+      }
+    }
+
+    if (!leaf?.isConnected) {
+      for (const target of targets) target.style.visibility = 'hidden';
+      return;
+    }
+
+    const rect = leaf.getBoundingClientRect();
+    if (!Number.isFinite(rect.left) || !Number.isFinite(rect.width) || rect.width <= 0) {
+      for (const target of targets) target.style.visibility = 'hidden';
+      return;
+    }
+
+    for (const target of targets) {
+      target.style.left = `${rect.left}px`;
+      target.style.right = 'auto';
+      target.style.width = `${rect.width}px`;
+      target.style.visibility = '';
+    }
+  }
+
+  scheduleEditorPaneBoundsUpdate() {
+    if (!this.isActive || this.editorPaneBoundsFrame) return;
+    const hostWindow =
+      this.getActiveMarkdownLeafElement()?.ownerDocument?.defaultView ||
+      window;
+    this.editorPaneBoundsFrameWindow = hostWindow;
+    this.editorPaneBoundsFrame = hostWindow.requestAnimationFrame(() => {
+      this.editorPaneBoundsFrame = null;
+      this.editorPaneBoundsFrameWindow = null;
+      this.updateEditorPaneBounds();
+      this.measureEditingToolbarStrip();
+      this.scheduleStatusPageUpdate();
+    });
+  }
+
+  stopEditorPaneBoundsTracking() {
+    this.editorPaneBoundsResizeObserver?.disconnect();
+    this.editorPaneBoundsResizeObserver = null;
+    this.editorPaneBoundsLeaf?.classList?.remove('composition-mode-editor-pane');
+    this.editorPaneBoundsLeaf = null;
+    if (this.editorPaneBoundsFrame) {
+      (this.editorPaneBoundsFrameWindow || window).cancelAnimationFrame(
+        this.editorPaneBoundsFrame
+      );
+      this.editorPaneBoundsFrame = null;
+      this.editorPaneBoundsFrameWindow = null;
+    }
+  }
 
   createBackdrop() {
     this.backdrop = document.createElement('div');
@@ -1540,59 +2073,61 @@ class CompositionModePlugin extends Plugin {
     const docText = activeView.editor?.getValue?.() || '';
     if (!docText) return;
 
-    const refs = [];
-    // Obsidian wikilinks: ![[file.png]] / ![[folder/file.png|alias]]
-    const reWiki = /!\[\[([^\]|#\n]+)(?:[|#][^\]\n]*)?\]\]/g;
-    let m;
-    while ((m = reWiki.exec(docText)) !== null) {
-      refs.push(m[1].trim());
-    }
-    // Standard markdown: ![alt](path.png) — skip external URLs
-    const reMd = /!\[[^\]]*\]\(\s*<?([^\s)>]+)>?(?:\s+"[^"]*")?\s*\)/g;
-    while ((m = reMd.exec(docText)) !== null) {
-      const raw = m[1].trim();
-      if (/^https?:/i.test(raw) || /^data:/i.test(raw)) continue;
-      try {
-        refs.push(decodeURIComponent(raw));
-      } catch (e) {
-        refs.push(raw);
+    this.preloadImageDimensionsFromText(docText, sourcePath);
+  }
+
+  preloadImageDimensionsFromText(docText, sourcePath, discoveredRefs = null) {
+    const refs = discoveredRefs || collectImageReferences(docText);
+    if (!refs.length) return;
+
+    // Full metric refreshes replace the active note's resolution table.
+    // Edit-time discovery carries only the already-scanned unknown refs, so
+    // merge those into the existing table without rescanning the document.
+    if (!discoveredRefs) this.currentImageKeyResolutions = new Map();
+
+    for (const ref of refs) {
+      const file = ref.linkpath
+        ? this.app.metadataCache.getFirstLinkpathDest(ref.linkpath, sourcePath)
+        : null;
+      if (!file && !ref.src) continue;
+      const cacheKey = file?.path || `external:${ref.src}`;
+      this.currentImageKeyResolutions.set(ref.key, cacheKey);
+      if (this.imageDimsCache.has(cacheKey)) {
+        // The dimensions are already known, but edit-time resolution may
+        // have introduced a new note-local alias. Rebuild so that mapping is
+        // applied without waiting for another activation or settings change.
+        if (discoveredRefs && this.isActive) this.scheduleMetricsRefreshAndRebuild();
+        continue;
       }
-    }
+      if (this.pendingImagePreloads.has(cacheKey)) continue;
 
-    for (const linkpath of refs) {
-      const file = this.app.metadataCache.getFirstLinkpathDest(linkpath, sourcePath);
-      if (!file) continue;
-      if (this.imageDimsCache.has(file.path)) continue;
-      if (this.pendingImagePreloads.has(file.path)) continue;
-
-      this.pendingImagePreloads.add(file.path);
+      this.pendingImagePreloads.add(cacheKey);
       const probe = new Image();
       const cleanup = (ok) => {
-        this.pendingImagePreloads.delete(file.path);
+        this.pendingImagePreloads.delete(cacheKey);
         if (ok && probe.naturalWidth > 0 && probe.naturalHeight > 0) {
-          this.imageDimsCache.set(file.path, {
+          this.imageDimsCache.set(cacheKey, {
             w: probe.naturalWidth,
             h: probe.naturalHeight,
-            basename: file.name.toLowerCase()
+            basename: file?.name?.toLowerCase?.() || ref.key,
+            keys: Array.from(new Set([
+              ref.key,
+              file?.name?.toLowerCase?.(),
+              file?.path?.toLowerCase?.()
+            ].filter(Boolean)))
           });
           if (this.isActive) this.scheduleMetricsRefreshAndRebuild();
         }
       };
       probe.addEventListener('load', () => cleanup(true), { once: true });
       probe.addEventListener('error', () => cleanup(false), { once: true });
-      probe.src = this.app.vault.getResourcePath(file);
+      probe.src = ref.src || this.app.vault.getResourcePath(file);
     }
   }
 
-  // Read the currently rendered note DOM and capture any exact image
-  // dimensions we can see right now. Live Preview / theme CSS may cap
-  // image width well below cmContent.clientWidth, which means the
-  // natural-dims fallback in buildImageHeightMap() can significantly
-  // overestimate image height and end pages too early. Visible images
-  // give us two useful signals:
-  //   1. exact rendered heights for images already in the DOM
-  //   2. a shared width cap we can reuse for off-screen images in the
-  //      same note, since themes usually size all body images the same way
+  // Read the currently rendered note DOM for diagnostics. Pagination uses
+  // natural aspect ratios plus the configured CSS width so visible and
+  // virtualized embeds follow the same deterministic sizing rule.
   getRenderedImageMetrics(elements = null) {
     const resolved = elements || this.getActiveCompositionElements();
     const root = resolved?.sourceView || resolved?.cmContent || null;
@@ -1623,43 +2158,123 @@ class CompositionModePlugin extends Plugin {
     return { heightMap, widthCap, count: heightMap.size };
   }
 
-  // Build a filename → displayed-height map for every image in the
-  // plugin's natural-dimensions cache. Height is
-  //   min(naturalWidth, contentWidth) × (naturalHeight / naturalWidth)
-  // — exactly how the browser lays the image out under `max-width: 100%`.
-  //
-  // No fallback. Every image referenced in the doc is a known vault
-  // file; preloadImageDimensionsFromDoc() populates the cache; lookups
-  // in estimateParagraphHeight() hit exact values. If a preload is
-  // still in flight when a rebuild fires, the corresponding image gets
-  // 0 height for this pass; the preload's load event will trigger
-  // another rebuild with the real dimension.
-  buildImageHeightMap(contentWidth, renderedImageMetrics = null) {
+  // Obsidian places an authored ![[image|400]] width on the embed wrapper
+  // when that signal is available, so it is authoritative even when the
+  // requested width happens to equal naturalWidth. Older render paths put
+  // width on the image itself; only there do we compare against naturalWidth
+  // to distinguish an override from Obsidian's intrinsic-size attribute.
+  syncImageEmbedWidthOverrides(elements = null) {
+    const resolved = elements || this.getActiveCompositionElements();
+    const root = resolved?.sourceView || resolved?.cmContent || null;
+    if (!root) return;
+
+    root.querySelectorAll('.cm-content .image-embed img, .cm-content .internal-embed img').forEach(img => {
+      const wrapper = img.closest('.image-embed, .internal-embed');
+      if (!wrapper) return;
+      const wrapperWidth = Number(wrapper.getAttribute('width')) || 0;
+      const imageWidth = Number(img.getAttribute('width')) || 0;
+      const naturalWidth = Number(img.naturalWidth) || 0;
+      let overrideWidth = wrapperWidth > 0 ? wrapperWidth : 0;
+
+      if (!overrideWidth && !naturalWidth) {
+        wrapper.classList.remove('composition-mode-image-width-override');
+        wrapper.style.removeProperty('--composition-mode-image-embed-width');
+        if (!img.__compositionModeWidthLoadBound) {
+          img.__compositionModeWidthLoadBound = true;
+          img.addEventListener('load', () => this.scheduleImageWidthSync(), { once: true });
+        }
+        return;
+      }
+
+      if (!overrideWidth && imageWidth > 0 && Math.abs(imageWidth - naturalWidth) > 0.5) {
+        overrideWidth = imageWidth;
+      }
+
+      if (overrideWidth > 0) {
+        wrapper.classList.add('composition-mode-image-width-override');
+        wrapper.style.setProperty('--composition-mode-image-embed-width', `${overrideWidth}px`);
+      } else {
+        wrapper.classList.remove('composition-mode-image-width-override');
+        wrapper.style.removeProperty('--composition-mode-image-embed-width');
+      }
+    });
+  }
+
+  scheduleImageWidthSync() {
+    if (!this.isActive || this.pendingImageWidthSyncFrame) return;
+    this.pendingImageWidthSyncFrame = requestAnimationFrame(() => {
+      this.pendingImageWidthSyncFrame = null;
+      if (!this.isActive) return;
+      this.syncImageEmbedWidthOverrides();
+    });
+  }
+
+  observeImageEmbedWidths(elements) {
+    const root = elements?.sourceView || null;
+    if (!root || this.imageWidthObserverRoot === root) return;
+    this.stopImageWidthObserver();
+    this.imageWidthObserverRoot = root;
+    this.imageWidthObserver = new MutationObserver(() => this.scheduleImageWidthSync());
+    // Watch only source/width signals plus inserted embeds. Excluding class
+    // and style prevents our own override updates from feeding the observer.
+    this.imageWidthObserver.observe(root, {
+      childList: true,
+      attributes: true,
+      attributeFilter: ['width', 'src'],
+      subtree: true
+    });
+  }
+
+  stopImageWidthObserver() {
+    this.imageWidthObserver?.disconnect();
+    this.imageWidthObserver = null;
+    this.imageWidthObserverRoot = null;
+    if (this.pendingImageWidthSyncFrame) {
+      cancelAnimationFrame(this.pendingImageWidthSyncFrame);
+      this.pendingImageWidthSyncFrame = null;
+    }
+  }
+
+  // Build a filename → displayed-height map for every cached image. CSS
+  // deliberately stretches image embeds to their configured share of the
+  // column, even when that exceeds naturalWidth, so the estimator uses the
+  // same effective width rather than imposing an intrinsic-size cap.
+  buildImageHeightMap(contentWidth) {
     const map = new Map();
+    this.imageAspectRatioMap = new Map();
     if (!contentWidth || contentWidth <= 0) return map;
 
-    const exactHeights =
-      renderedImageMetrics?.heightMap instanceof Map
-        ? renderedImageMetrics.heightMap
-        : null;
-    const widthCap = Math.max(
-      0,
-      Math.min(
-        contentWidth,
-        renderedImageMetrics?.widthCap || 0
-      )
-    );
-    const effectiveWidth = widthCap > 0 ? widthCap : contentWidth;
+    const pct = Math.max(20, Math.min(100, this.settings.imageWidthPct || 100));
+    const effectiveWidth = contentWidth * (pct / 100);
+    const pageContentHeight = Math.max(0, pageBreakConfig.pageContentHeight || 0);
 
     for (const dims of this.imageDimsCache.values()) {
       if (!dims || !dims.basename || dims.w <= 0 || dims.h <= 0) continue;
-      if (exactHeights?.has(dims.basename)) {
-        map.set(dims.basename, exactHeights.get(dims.basename));
-        continue;
+      const ratio = dims.h / dims.w;
+      const displayedHeight = effectiveWidth * ratio;
+      const cappedHeight = pageContentHeight > 0
+        ? Math.min(displayedHeight, pageContentHeight)
+        : displayedHeight;
+      for (const key of (dims.keys || [dims.basename])) {
+        this.imageAspectRatioMap.set(key, ratio);
+        map.set(key, Math.round(cappedHeight));
       }
-      const displayedWidth = Math.min(dims.w, effectiveWidth);
-      const displayedHeight = displayedWidth * (dims.h / dims.w);
-      map.set(dims.basename, Math.round(displayedHeight));
+    }
+
+    // Reapply every key referenced by the active note after the cache walk.
+    // This includes the metadata-cache resolution for plain basenames, so
+    // two same-named files cannot make cache insertion order choose which
+    // dimensions the unqualified reference receives.
+    for (const [referenceKey, cacheKey] of this.currentImageKeyResolutions || []) {
+      const dims = this.imageDimsCache.get(cacheKey);
+      if (!dims || dims.w <= 0 || dims.h <= 0) continue;
+      const ratio = dims.h / dims.w;
+      const displayedHeight = effectiveWidth * ratio;
+      const cappedHeight = pageContentHeight > 0
+        ? Math.min(displayedHeight, pageContentHeight)
+        : displayedHeight;
+      this.imageAspectRatioMap.set(referenceKey, ratio);
+      map.set(referenceKey, Math.round(cappedHeight));
     }
 
     return map;
@@ -1716,6 +2331,7 @@ class CompositionModePlugin extends Plugin {
       body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-editor {
         --composition-mode-page-margin-x: ${effectiveMarginXIn}in;
         --composition-mode-page-margin-y-px: ${effectiveMarginYIn}in;
+        --composition-mode-page-content-height-px: ${(paperSizeDef.height - (2 * effectiveMarginYIn))}in;
       }
       body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .markdown-source-view.mod-cm6,
       body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-editor,
@@ -1735,6 +2351,11 @@ class CompositionModePlugin extends Plugin {
         max-width: ${Math.max(20, Math.min(100, this.settings.imageWidthPct || 100))}% !important;
         margin-left: auto !important;
         margin-right: auto !important;
+      }
+      body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .internal-embed.image-embed.composition-mode-image-width-override,
+      body.composition-mode-active .workspace-leaf-content[data-type="markdown"] .cm-content .image-embed.composition-mode-image-width-override {
+        width: min(100%, var(--composition-mode-image-embed-width)) !important;
+        max-width: 100% !important;
       }
     `;
 
@@ -1776,6 +2397,30 @@ class CompositionModePlugin extends Plugin {
       this.updateScrollerMetrics();
       this.triggerEditors();
     });
+  }
+
+  scheduleZeroMetricRetry() {
+    if (!this.isActive || !this.showPageBreaks) return;
+    if (this.pendingZeroMetricRetryFrame || this.zeroMetricRetryCount >= 3) return;
+
+    this.zeroMetricRetryCount += 1;
+    this.pendingZeroMetricRetryFrame = requestAnimationFrame(() => {
+      this.pendingZeroMetricRetryFrame = null;
+      if (!this.isActive || !this.showPageBreaks) {
+        this.zeroMetricRetryCount = 0;
+        return;
+      }
+      this.updateScrollerMetrics();
+      this.triggerEditors();
+    });
+  }
+
+  resetZeroMetricRetries() {
+    this.zeroMetricRetryCount = 0;
+    if (this.pendingZeroMetricRetryFrame) {
+      cancelAnimationFrame(this.pendingZeroMetricRetryFrame);
+      this.pendingZeroMetricRetryFrame = null;
+    }
   }
 
   // Read the scroller's rendered horizontal padding (= paper's horizontal
@@ -1987,6 +2632,7 @@ class CompositionModePlugin extends Plugin {
   triggerEditors() {
     pageBreakConfig.enabled = this.isActive && this.showPageBreaks;
     pageBreakConfig.wordsPerPage = this.settings.pageWordCount || 400;
+    pageBreakConfig.imageWidthPct = Math.max(20, Math.min(100, this.settings.imageWidthPct || 100));
     // Gap height at reference scale. CSS transform zoom handles visual
     // scaling — no need to multiply by zoom here.
     pageBreakConfig.gapHeight = this.settings.pageGapHeight || 60;
@@ -2041,6 +2687,15 @@ class CompositionModePlugin extends Plugin {
       pageBreakConfig.pageHeight = 0;
     }
     pageBreakConfig.pageMarginY = pageMarginY;
+    pageBreakConfig.pageContentHeight = Math.max(0, pageBreakConfig.pageHeight - (2 * pageMarginY));
+    document.documentElement.style.setProperty(
+      '--composition-mode-page-content-height-px',
+      `${pageBreakConfig.pageContentHeight}px`
+    );
+    elements.sourceView?.querySelector('.cm-editor')?.style?.setProperty(
+      '--composition-mode-page-content-height-px',
+      `${pageBreakConfig.pageContentHeight}px`
+    );
 
     if (cmLine && cmContent) {
       const lineStyle = getComputedStyle(cmLine);
@@ -2072,11 +2727,11 @@ class CompositionModePlugin extends Plugin {
     // completed preload schedules a rebuild via scheduleMetricsRefresh-
     // AndRebuild, so pagination self-corrects as dimensions arrive.
     this.preloadImageDimensionsFromDoc(elements.activeView);
+    this.observeImageEmbedWidths(elements);
+    this.syncImageEmbedWidthOverrides(elements);
     const renderedImageMetrics = this.getRenderedImageMetrics(elements);
-    pageBreakConfig.imageHeightMap = this.buildImageHeightMap(
-      pageBreakConfig.contentWidth,
-      renderedImageMetrics
-    );
+    pageBreakConfig.imageHeightMap = this.buildImageHeightMap(pageBreakConfig.contentWidth);
+    pageBreakConfig.imageAspectRatioMap = this.imageAspectRatioMap || new Map();
     pageBreakConfig.normalizeForLivePreview = isLivePreview;
     pageBreakConfig.suppressFrontmatter = isLivePreview && hasFrontmatter;
     pageBreakConfig.headingScale = 1.3;
@@ -2132,8 +2787,12 @@ class CompositionModePlugin extends Plugin {
             const val = view.editor.cm.state.field(pageBreakField);
             fieldHits++;
             if (val && typeof val.size === 'number') postDispatchSize = val.size;
-          } catch (e) {}
-        } catch (e) {}
+          } catch (e) {
+            dbg(`dispatch: field-read error=${e?.message || String(e)}`);
+          }
+        } catch (e) {
+          dbg(`dispatch: editor error=${e?.message || String(e)}`);
+        }
       }
     });
     dbg(`dispatch: count=${dispatchCount} fieldHits=${fieldHits} postDispatchSize=${postDispatchSize}`);
@@ -2175,45 +2834,79 @@ class CompositionModePlugin extends Plugin {
     }
   }
 
-  createHoverZone() {
-    this.hoverZone = document.createElement('div');
-    this.hoverZone.className = 'composition-mode-hover-zone';
-    this.hoverZone.addEventListener('mouseenter', () => {
-      if (this.controlBar) this.controlBar.classList.add('is-visible');
-    });
-    document.body.appendChild(this.hoverZone);
+  applyStatusBarVisibility() {
+    if (!this.isActive) return;
+    if (this.settings.showStatusBar !== false) {
+      if (!this.controlBar) this.createControlBar();
+      this.setupStatusBarListeners();
+    } else {
+      this.destroyStatusBar();
+    }
+  }
+
+  toggleStatusBar() {
+    this.settings.showStatusBar = this.settings.showStatusBar === false;
+    this.saveSettings();
+    if (this.isActive) this.applyStatusBarVisibility();
+  }
+
+  destroyStatusBar() {
+    this.teardownStatusBarListeners();
+    if (this.statusPopoverOutsideHandler) {
+      document.removeEventListener('pointerdown', this.statusPopoverOutsideHandler, true);
+      this.statusPopoverOutsideHandler = null;
+    }
+    if (this.controlBar) this.controlBar.remove();
+    this.controlBar = null;
+    this.pageStatusEl = null;
+    this.wordCountEl = null;
+    this.zoomDisplay = null;
+    this.zoomSlider = null;
+    this.typeDisplay = null;
+    this.paperSizeBtn = null;
+    this.pagesBtn = null;
+    this.statusPopover = null;
+    this.statusPopoverTrigger = null;
   }
 
   createControlBar() {
     this.controlBar = document.createElement('div');
     this.controlBar.className = 'composition-mode-control-bar';
 
-    this.controlBar.addEventListener('mouseenter', () => {
-      this.controlBar.classList.add('is-visible');
-    });
-    this.controlBar.addEventListener('mouseleave', () => {
-      this.controlBar.classList.remove('is-visible');
-    });
+    // Word's useful grammar is informational state on the left and editing /
+    // view controls on the right. This remains Obsidian-native and reuses every
+    // existing Composition Mode setting path; no formatting controls are added.
+    const left = this.makeEl('div', 'composition-mode-status-left');
+    const pageStatusEl = this.makeEl('span', 'composition-mode-page-status');
+    this.pageStatusEl = pageStatusEl;
+    const separator = this.makeEl('span', 'composition-mode-status-separator');
+    separator.textContent = '·';
+    const wordCountEl = this.makeEl('span', 'composition-mode-word-count');
+    this.wordCountEl = wordCountEl;
+    left.append(pageStatusEl, separator, wordCountEl);
 
-    // Zoom controls
-    const zoomGroup = this.makeGroup('Zoom');
-    const zoomMinus = this.makeEl('button', 'composition-mode-btn');
-    zoomMinus.textContent = '−';
-    zoomMinus.addEventListener('click', () => this.zoomOut());
-    const zoomEl = this.makeEl('div', 'composition-mode-zoom-display');
-    this.zoomDisplay = zoomEl;
-    const zoomPlus = this.makeEl('button', 'composition-mode-btn');
-    zoomPlus.textContent = '+';
-    zoomPlus.addEventListener('click', () => this.zoomIn());
-    const zoomReset = this.makeEl('button', 'composition-mode-btn');
-    zoomReset.textContent = '1:1';
-    zoomReset.addEventListener('click', () => {
-      this.resetZoom();
-    });
-    zoomGroup.append(zoomMinus, zoomEl, zoomPlus, zoomReset);
+    const right = this.makeEl('div', 'composition-mode-status-right');
+    const settingsWrap = this.makeEl('div', 'composition-mode-status-settings');
+    const settingsBtn = this.makeEl('button', 'composition-mode-btn composition-mode-settings-trigger');
+    settingsBtn.type = 'button';
+    settingsBtn.textContent = 'Aa';
+    settingsBtn.setAttribute('aria-label', 'Document settings');
+    settingsBtn.setAttribute('aria-haspopup', 'true');
+    settingsBtn.setAttribute('aria-expanded', 'false');
+    settingsBtn.setAttribute('title', 'Document settings');
+    this.statusPopoverTrigger = settingsBtn;
 
-    // Type size controls
-    const typeGroup = this.makeGroup('Type');
+    // The former wall of document controls now lives in one quiet, transient
+    // panel. The controls and their event paths below are intentionally the
+    // same ones the status bar used before; only their DOM home changes.
+    const settingsPopover = this.makeEl('div', 'composition-mode-status-popover');
+    settingsPopover.hidden = true;
+    settingsPopover.setAttribute('role', 'dialog');
+    settingsPopover.setAttribute('aria-label', 'Document settings');
+    this.statusPopover = settingsPopover;
+
+    // Existing type-size controls.
+    const typeGroup = this.makeGroup('Type size');
     const typeMinus = this.makeEl('button', 'composition-mode-btn');
     typeMinus.textContent = '−';
     typeMinus.addEventListener('click', () => this.typeSizeBy(-0.5));
@@ -2225,7 +2918,7 @@ class CompositionModePlugin extends Plugin {
     typeGroup.append(typeMinus, typeEl, typePlus);
 
     // Paper size toggle
-    const paperSizeGroup = this.makeGroup('Paper');
+    const paperSizeGroup = this.makeGroup('Paper size');
     const paperSizeBtn = this.makeEl('button', 'composition-mode-btn');
     paperSizeBtn.textContent = (PAPER_SIZES[this.paperSize] || PAPER_SIZES.letter).label;
     this.paperSizeBtn = paperSizeBtn;
@@ -2242,7 +2935,7 @@ class CompositionModePlugin extends Plugin {
     paperSizeGroup.appendChild(paperSizeBtn);
 
     // Pages toggle
-    const pagesGroup = this.makeGroup('Pages');
+    const pagesGroup = this.makeGroup('Page gaps');
     const pagesBtn = this.makeEl('button', 'composition-mode-btn');
     pagesBtn.textContent = this.showPageBreaks ? 'On' : 'Off';
     this.pagesBtn = pagesBtn;
@@ -2260,7 +2953,7 @@ class CompositionModePlugin extends Plugin {
     this.paperWidth = 90;
 
     // Side margins slider
-    const sideMarginGroup = this.makeGroup('Side');
+    const sideMarginGroup = this.makeGroup('Side margin');
     const sideMarginSlider = this.makeSlider(0.25, 2.5, 0.25, this.settings.pageMarginXIn ?? 1.25, (v) => {
       this.settings.pageMarginXIn = v;
       this.saveSettings();
@@ -2269,7 +2962,7 @@ class CompositionModePlugin extends Plugin {
     sideMarginGroup.appendChild(sideMarginSlider);
 
     // Top/bottom margins slider
-    const topMarginGroup = this.makeGroup('Top');
+    const topMarginGroup = this.makeGroup('Top / bottom');
     const topMarginSlider = this.makeSlider(0.25, 2, 0.25, this.settings.pageMarginYIn ?? 1.0, (v) => {
       this.settings.pageMarginYIn = v;
       this.saveSettings();
@@ -2285,25 +2978,77 @@ class CompositionModePlugin extends Plugin {
     });
     fadeGroup.appendChild(fadeSlider);
 
-    // Word count
-    const wordCountEl = this.makeEl('div', 'composition-mode-word-count');
-    this.wordCountEl = wordCountEl;
-    this.updateWordCount();
-
     // Exit button
     const exitBtn = this.makeEl('button', 'composition-mode-btn composition-mode-exit-btn');
     exitBtn.textContent = 'Exit';
     exitBtn.addEventListener('click', () => this.deactivate());
 
-    this.controlBar.append(zoomGroup, typeGroup, paperSizeGroup, pagesGroup, sideMarginGroup, topMarginGroup, fadeGroup, wordCountEl, exitBtn);
+    // Word-style zoom cluster: step buttons, the existing per-note zoom value
+    // on a slider, and a tabular readout. All three call the same apply/save
+    // path as keyboard, wheel, and gesture zoom.
+    const zoomGroup = this.makeGroup('Zoom');
+    zoomGroup.classList.add('composition-mode-zoom-group');
+    const zoomMinus = this.makeEl('button', 'composition-mode-btn composition-mode-zoom-step');
+    zoomMinus.textContent = '−';
+    zoomMinus.addEventListener('click', () => this.zoomOut());
+    const zoomSlider = this.makeSlider(
+      MIN_VISUAL_ZOOM,
+      MAX_VISUAL_ZOOM,
+      0.1,
+      this.currentZoom,
+      (value) => {
+        this.currentZoom = this.clampZoom(value);
+        this.applyStyles();
+        this.saveZoomLevel();
+      }
+    );
+    zoomSlider.classList.add('composition-mode-zoom-slider');
+    this.zoomSlider = zoomSlider;
+    const zoomPlus = this.makeEl('button', 'composition-mode-btn composition-mode-zoom-step');
+    zoomPlus.textContent = '+';
+    zoomPlus.addEventListener('click', () => this.zoomIn());
+    const zoomEl = this.makeEl('div', 'composition-mode-zoom-display');
+    this.zoomDisplay = zoomEl;
+    zoomGroup.append(zoomMinus, zoomSlider, zoomPlus, zoomEl);
+
+    settingsPopover.append(typeGroup, paperSizeGroup, pagesGroup, sideMarginGroup, topMarginGroup, fadeGroup);
+    settingsWrap.append(settingsBtn, settingsPopover);
+    settingsBtn.addEventListener('click', () => this.toggleStatusPopover());
+
+    // Word's calm grammar: document status owns the left; the right is only
+    // document settings, zoom, then the unambiguous way out.
+    right.append(settingsWrap, zoomGroup, exitBtn);
+    this.controlBar.append(left, right);
     document.body.appendChild(this.controlBar);
+    this.updateEditorPaneBounds();
+
+    this.statusPopoverOutsideHandler = (event) => {
+      if (!this.statusPopover || this.statusPopover.hidden) return;
+      if (this.statusPopover.contains(event.target) || this.statusPopoverTrigger?.contains(event.target)) return;
+      this.closeStatusPopover();
+    };
+    document.addEventListener('pointerdown', this.statusPopoverOutsideHandler, true);
 
     this.updateZoomDisplay();
     this.updateTypeDisplay();
+    this.updateWordCount();
+    this.updatePageStatus();
+  }
 
-    this.wordCountInterval = setInterval(() => {
-      if (this.isActive) this.updateWordCount();
-    }, 2000);
+  toggleStatusPopover() {
+    if (!this.statusPopover || !this.statusPopoverTrigger) return;
+    if (this.statusPopover.hidden) {
+      this.statusPopover.hidden = false;
+      this.statusPopoverTrigger.setAttribute('aria-expanded', 'true');
+    } else {
+      this.closeStatusPopover();
+    }
+  }
+
+  closeStatusPopover() {
+    if (!this.statusPopover) return;
+    this.statusPopover.hidden = true;
+    this.statusPopoverTrigger?.setAttribute('aria-expanded', 'false');
   }
 
   // --- Helpers ---
@@ -2339,15 +3084,100 @@ class CompositionModePlugin extends Plugin {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (view) {
       const text = view.editor.getValue();
-      const words = text.trim().split(/\s+/).filter(w => w.length > 0).length;
+      const elements = this.getActiveCompositionElements();
+      const hasFrontmatter = !!(
+        elements.activeView?.file &&
+        this.app.metadataCache.getFileCache(elements.activeView.file)?.frontmatter
+      );
+      const suppressFrontmatter =
+        !!elements.sourceView?.classList?.contains('is-live-preview') &&
+        hasFrontmatter;
+      const words = countDocumentWords(text, suppressFrontmatter);
       this.wordCountEl.textContent = `${words.toLocaleString()} words`;
     }
+  }
+
+  scheduleStatusWordCountUpdate(delay = 120) {
+    if (!this.isActive || this.settings.showStatusBar === false || !this.controlBar) return;
+    if (this.statusWordCountTimer) clearTimeout(this.statusWordCountTimer);
+    this.statusWordCountTimer = setTimeout(() => {
+      this.statusWordCountTimer = null;
+      this.updateWordCount();
+    }, delay);
+  }
+
+  setupStatusBarListeners() {
+    if (!this.controlBar || this.settings.showStatusBar === false) return;
+    const { scroller } = this.getActiveCompositionElements();
+    if (this.statusScroller === scroller && this.statusScrollHandler) return;
+    this.teardownStatusBarScrollListener();
+    if (!scroller) return;
+
+    this.statusScroller = scroller;
+    this.statusScrollHandler = () => this.scheduleStatusPageUpdate();
+    scroller.addEventListener('scroll', this.statusScrollHandler, { passive: true });
+    this.scheduleStatusPageUpdate();
+  }
+
+  teardownStatusBarScrollListener() {
+    if (this.statusScroller && this.statusScrollHandler) {
+      this.statusScroller.removeEventListener('scroll', this.statusScrollHandler);
+    }
+    this.statusScroller = null;
+    this.statusScrollHandler = null;
+    if (this.statusPageFrame) {
+      cancelAnimationFrame(this.statusPageFrame);
+      this.statusPageFrame = null;
+    }
+  }
+
+  teardownStatusBarListeners() {
+    this.teardownStatusBarScrollListener();
+    if (this.statusWordCountTimer) {
+      clearTimeout(this.statusWordCountTimer);
+      this.statusWordCountTimer = null;
+    }
+  }
+
+  scheduleStatusPageUpdate() {
+    if (!this.isActive || this.settings.showStatusBar === false || !this.controlBar) return;
+    if (this.statusPageFrame) return;
+    this.statusPageFrame = requestAnimationFrame(() => {
+      this.statusPageFrame = null;
+      this.updatePageStatus();
+    });
+  }
+
+  updatePageStatus() {
+    if (!this.pageStatusEl) return;
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const editorState = view?.editor?.cm?.state;
+    const status = editorState ? paginationStatusByEditorState.get(editorState) : null;
+    if (status) {
+      pageBreakConfig.pageCount = status.pageCount;
+      pageBreakConfig.pageTopBoundaries = status.pageTopBoundaries.slice();
+    }
+    const tops = pageBreakConfig.pageTopBoundaries || [0];
+    const totalPages = Math.max(1, pageBreakConfig.pageCount || tops.length || 1);
+    const { scroller } = this.getActiveCompositionElements();
+    // `.cm-scroller` is inside the CSS-zoomed paper, but CSSOM scrollTop and
+    // clientHeight are reported in the same unscaled layout-space coordinates
+    // as the page tops captured by computePageBreaks (the same invariant used
+    // for clientWidth in applyStyles/triggerEditors).
+    const currentPage = currentPageFromScroll(
+      scroller?.scrollTop || 0,
+      scroller?.clientHeight || 0,
+      tops
+    );
+    this.pageStatusEl.textContent = `Page ${Math.min(currentPage, totalPages)} of ${totalPages}`;
   }
 
   updateZoomDisplay() {
     if (this.zoomDisplay) {
       this.zoomDisplay.textContent = `${Math.round(this.currentZoom * 100)}%`;
     }
+    if (this.zoomSlider) this.zoomSlider.value = this.currentZoom;
+    this.scheduleStatusPageUpdate();
   }
 
   updateTypeDisplay() {
@@ -2411,9 +3241,12 @@ class CompositionModePlugin extends Plugin {
   setupResizeHandler() {
     this.resizeHandler = () => {
       if (!this.isActive) return;
+      this.scheduleEditorPaneBoundsUpdate();
       this.applyStyles();
     };
     window.addEventListener('resize', this.resizeHandler);
+    this.app.workspace.on('resize', this.resizeHandler);
+    this.updateEditorPaneBounds();
   }
 
   resetZoom() {
@@ -2579,6 +3412,17 @@ class CompositionModeSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
+      .setName('Show status bar')
+      .setDesc('Show page position, live word count, document controls, and zoom at the bottom of Composition Mode.')
+      .addToggle(t => t
+        .setValue(this.plugin.settings.showStatusBar !== false)
+        .onChange(async (v) => {
+          this.plugin.settings.showStatusBar = v;
+          await this.plugin.saveSettings();
+          if (this.plugin.isActive) this.plugin.applyStatusBarVisibility();
+        }));
+
+    new Setting(containerEl)
       .setName('Enable debug mode')
       .setDesc('Write verbose pagination logs to working/composition-mode-page-break-debug.md and enable automatic debug diagnostics. Off by default.')
       .addToggle(t => t
@@ -2589,5 +3433,19 @@ class CompositionModeSettingTab extends PluginSettingTab {
         }));
   }
 }
+
+// Test seam: expose pure pagination helpers without changing plugin runtime
+// behavior or introducing a production dependency on a test framework.
+CompositionModePlugin.__testables = {
+  makeMeasurer,
+  estimateParagraphHeight,
+  estimateTextHeight,
+  findTextOffsetForVisualLines,
+  chooseReadableSplitOffset,
+  findMidParagraphSplit,
+  extractImageKey,
+  currentPageFromScroll,
+  countDocumentWords
+};
 
 module.exports = CompositionModePlugin;
