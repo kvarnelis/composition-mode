@@ -1783,7 +1783,7 @@ class CompositionModePlugin extends Plugin {
   // `appendMethod: workspace` inserts directly into .mod-vertical.mod-root.
   // Neither location is safe for Composition Mode: the view is paper-width /
   // zoom constrained, and the root split lays direct children out as columns.
-  // Temporarily lift only the known hosts into our fixed, out-of-flow strip.
+  // Temporarily lift only the known hosts into our fixed, out-of-flow band.
   //
   // Editing Toolbar regenerates its controls after leaf, layout, and resize
   // events. Observe those insertions and make the accommodation idempotent.
@@ -1846,6 +1846,9 @@ class CompositionModePlugin extends Plugin {
         strip.appendChild(host);
       }
       this.measureEditingToolbarStrip();
+      if (this.barAutoHideToolbarPopupArmed || this.barAutoHideToolbarPopoverWasOpen) {
+        this.refreshBarAutoHideForPointer();
+      }
     };
 
     relocate();
@@ -1892,16 +1895,19 @@ class CompositionModePlugin extends Plugin {
       hostDocument.body;
     if (!appContainer) return null;
 
+    const band = hostDocument.createElement('div');
+    band.className = 'composition-mode-toolbar-band';
     const strip = hostDocument.createElement('div');
     strip.className = 'composition-mode-toolbar-strip';
     strip.setAttribute('role', 'toolbar');
     strip.setAttribute('aria-label', 'Editing toolbar');
-    appContainer.appendChild(strip);
+    band.appendChild(strip);
+    appContainer.appendChild(band);
+    this.editingToolbarBand = band;
     this.editingToolbarStrip = strip;
 
-    // Reserving exactly the rendered strip height prevents the fixed controls
-    // from covering note content. It only shortens the workspace viewport:
-    // paper width/centering and page-break measurements remain unchanged.
+    // The strip overlays the editor, but its rendered height still determines
+    // where the overlay scrollbar track can safely begin.
     const ResizeObserverCtor = hostDocument.defaultView?.ResizeObserver;
     if (ResizeObserverCtor) {
       this.editingToolbarStripResizeObserver = new ResizeObserverCtor(() => {
@@ -1909,7 +1915,6 @@ class CompositionModePlugin extends Plugin {
       });
       this.editingToolbarStripResizeObserver.observe(strip);
     }
-    hostDocument.body?.classList.add('composition-mode-toolbar-strip-visible');
     this.startEditingToolbarFullscreenTracking(hostDocument);
     this.updateEditingToolbarClearance();
     this.updateEditorPaneBounds();
@@ -1977,26 +1982,22 @@ class CompositionModePlugin extends Plugin {
       '--composition-mode-toolbar-clearance',
       `${clearance}px`
     );
-    this.scheduleStatusPageUpdate();
+    this.scheduleEditorPaneBoundsUpdate();
   }
 
   measureEditingToolbarStrip() {
     const strip = this.editingToolbarStrip;
     if (!strip?.isConnected) return;
-    // Constrain first: toolbar wrapping (and therefore its reserved height)
+    // Constrain first: toolbar wrapping (and therefore its overlay height)
     // depends on the active markdown leaf's width.
     this.updateEditorPaneBounds();
     const height = Math.max(0, Math.ceil(strip.getBoundingClientRect().height || strip.offsetHeight || 0));
     if (height === this.editingToolbarStripHeight) return;
     this.editingToolbarStripHeight = height;
-    strip.ownerDocument.documentElement.style.setProperty(
-      '--composition-mode-toolbar-strip-height',
-      `${height}px`
-    );
-    // Page breaks use fixed paper metrics, not viewport height. The status
-    // page indicator does use the viewport-center bias, so refresh that cheap
-    // read whenever the reserved strip changes the scroller's clientHeight.
-    this.scheduleStatusPageUpdate();
+    // The overlay scrollbar's track starts below the overlaid strip, so a
+    // height change moves its top edge. The unchanged-height early return
+    // above keeps this from ping-ponging with updateEditorPaneBounds.
+    this.scheduleEditorPaneBoundsUpdate();
   }
 
   destroyEditingToolbarStrip() {
@@ -2004,20 +2005,27 @@ class CompositionModePlugin extends Plugin {
     this.editingToolbarStripResizeObserver = null;
 
     const strip = this.editingToolbarStrip;
+    const band = this.editingToolbarBand;
+    const hadToolbar = !!(band || strip);
     const hostDocument =
       strip?.ownerDocument ||
+      band?.ownerDocument ||
       this.editingToolbarFullscreenDocument ||
       document;
     this.stopEditingToolbarFullscreenTracking();
-    if (strip) strip.remove();
+    if (band) band.remove();
+    else if (strip) strip.remove();
+    this.editingToolbarBand = null;
     this.editingToolbarStrip = null;
     this.editingToolbarStripHeight = 0;
     this.editingToolbarClearance = 0;
+    this.barAutoHideToolbarPopupArmed = false;
+    this.barAutoHideToolbarPopupBaseline = null;
+    this.barAutoHideToolbarPopoverWasOpen = false;
     this.clearBarAutoHideTimer('toolbar');
     if (this.barAutoHidePointerLock === 'toolbar') this.barAutoHidePointerLock = null;
-    hostDocument.body?.classList.remove('composition-mode-toolbar-strip-visible');
-    hostDocument.documentElement?.style.removeProperty('--composition-mode-toolbar-strip-height');
     hostDocument.documentElement?.style.removeProperty('--composition-mode-toolbar-clearance');
+    if (hadToolbar) this.scheduleEditorPaneBoundsUpdate();
   }
 
   getActiveMarkdownLeafElement() {
@@ -2030,7 +2038,7 @@ class CompositionModePlugin extends Plugin {
     if (!this.isActive) return;
     const leaf = this.getActiveMarkdownLeafElement();
     const targets = [
-      this.editingToolbarStrip,
+      this.editingToolbarBand,
       this.controlBar,
       this.barAutoHideTopZone,
       this.barAutoHideBottomZone,
@@ -2038,11 +2046,9 @@ class CompositionModePlugin extends Plugin {
     ].filter(Boolean);
 
     if (leaf !== this.editorPaneBoundsLeaf) {
-      this.editorPaneBoundsLeaf?.classList?.remove('composition-mode-editor-pane');
       this.editorPaneBoundsResizeObserver?.disconnect();
       this.editorPaneBoundsResizeObserver = null;
       this.editorPaneBoundsLeaf = leaf?.isConnected ? leaf : null;
-      this.editorPaneBoundsLeaf?.classList?.add('composition-mode-editor-pane');
       const ResizeObserverCtor = leaf?.ownerDocument?.defaultView?.ResizeObserver;
       if (leaf?.isConnected && ResizeObserverCtor) {
         this.editorPaneBoundsResizeObserver = new ResizeObserverCtor(() => {
@@ -2069,6 +2075,9 @@ class CompositionModePlugin extends Plugin {
       target.style.width = `${rect.width}px`;
       target.style.visibility = '';
     }
+    if (this.editingToolbarBand) {
+      this.editingToolbarBand.style.top = `${rect.top}px`;
+    }
     if (this.barAutoHideTopZone) {
       this.barAutoHideTopZone.style.top = `${rect.top}px`;
     }
@@ -2079,8 +2088,15 @@ class CompositionModePlugin extends Plugin {
     if (this.overlayScrollbar) {
       this.overlayScrollbar.style.left = `${rect.right - OVERLAY_SCROLLBAR_TRACK_WIDTH_PX}px`;
       this.overlayScrollbar.style.width = `${OVERLAY_SCROLLBAR_TRACK_WIDTH_PX}px`;
-      this.overlayScrollbar.style.top = `${rect.top}px`;
-      this.overlayScrollbar.style.height = `${rect.height}px`;
+      // CSS composes the band from clearance padding + the measured strip.
+      // Read the resulting box so the track starts at the exact painted edge,
+      // including during fullscreen and toolbar-wrapping transitions.
+      // 5px breathing room so the track never touches the band's bottom rule.
+      const toolbarInset = this.editingToolbarBand
+        ? Math.max(0, this.editingToolbarBand.getBoundingClientRect().height) + 5
+        : 0;
+      this.overlayScrollbar.style.top = `${rect.top + toolbarInset}px`;
+      this.overlayScrollbar.style.height = `${Math.max(0, rect.height - toolbarInset)}px`;
       this.updateOverlayScrollbar();
     }
   }
@@ -2104,7 +2120,6 @@ class CompositionModePlugin extends Plugin {
   stopEditorPaneBoundsTracking() {
     this.editorPaneBoundsResizeObserver?.disconnect();
     this.editorPaneBoundsResizeObserver = null;
-    this.editorPaneBoundsLeaf?.classList?.remove('composition-mode-editor-pane');
     this.editorPaneBoundsLeaf = null;
     if (this.editorPaneBoundsFrame) {
       (this.editorPaneBoundsFrameWindow || window).cancelAnimationFrame(
@@ -2230,6 +2245,10 @@ class CompositionModePlugin extends Plugin {
     const { scroller } = this.getActiveCompositionElements();
     this.bindOverlayScrollbarScroller(scroller);
     const activeScroller = this.overlayScrollbarScroller;
+    // [hidden] means display:none, so clientHeight reads 0 while hidden and
+    // the track could never unhide. Unhide before measuring; the bail
+    // branches below re-hide without an intermediate paint.
+    track.hidden = false;
     const trackHeight = track.clientHeight;
     if (!activeScroller || trackHeight <= 0) {
       track.hidden = true;
@@ -2361,6 +2380,9 @@ class CompositionModePlugin extends Plugin {
 
     this.barAutoHideLastPointer = null;
     this.barAutoHidePointerLock = null;
+    this.barAutoHideToolbarPopupArmed = false;
+    this.barAutoHideToolbarPopupBaseline = null;
+    this.barAutoHideToolbarPopoverWasOpen = false;
     this.barAutoHideToolbarVisible = true;
     this.barAutoHideStatusVisible = true;
 
@@ -2381,7 +2403,17 @@ class CompositionModePlugin extends Plugin {
       const bar = this.getBarForEventTarget(event.target);
       if (!bar) {
         this.refreshBarAutoHideForPointer();
+        const eventDocument = event.target?.ownerDocument || document;
+        eventDocument.defaultView?.requestAnimationFrame(() => {
+          this.refreshBarAutoHideForPointer();
+        });
         return;
+      }
+      if (bar === 'toolbar') {
+        this.barAutoHideToolbarPopupArmed = true;
+        this.barAutoHideToolbarPopupBaseline = new Set(
+          this.getVisibleToolbarPortalPopups(event.target?.ownerDocument || document)
+        );
       }
       this.barAutoHidePointerLock = bar;
       this.setBarAutoHideVisible(bar, true);
@@ -2389,6 +2421,7 @@ class CompositionModePlugin extends Plugin {
     };
     this.barAutoHidePointerUpHandler = (event) => {
       if (!this.barAutoHidePointerLock) return;
+      const releasedBar = this.barAutoHidePointerLock;
       const eventDocument = event.target?.ownerDocument || document;
       this.barAutoHideLastPointer = {
         x: event.clientX,
@@ -2396,18 +2429,25 @@ class CompositionModePlugin extends Plugin {
         target: eventDocument.elementFromPoint?.(event.clientX, event.clientY) || event.target
       };
       this.barAutoHidePointerLock = null;
-      this.refreshBarAutoHideForPointer();
+      if (releasedBar === 'toolbar') {
+        // Toolbar click handlers open portalled menus after pointerup.
+        eventDocument.defaultView?.requestAnimationFrame(() => {
+          this.refreshBarAutoHideForPointer();
+        });
+      } else {
+        this.refreshBarAutoHideForPointer();
+      }
     };
     this.barAutoHideKeyDownHandler = (event) => {
       if (!event.target?.closest?.('.cm-editor')) return;
-      this.clearBarAutoHideTimer('toolbar');
-      this.clearBarAutoHideTimer('status');
-      if (this.barAutoHidePointerLock !== 'toolbar') {
-        this.setBarAutoHideVisible('toolbar', false);
-      }
-      if (this.barAutoHidePointerLock !== 'status' &&
-          (!this.statusPopover || this.statusPopover.hidden)) {
-        this.setBarAutoHideVisible('status', false);
+      for (const bar of ['toolbar', 'status']) {
+        if (this.isBarAutoHideProtected(bar)) {
+          this.clearBarAutoHideTimer(bar);
+          this.setBarAutoHideVisible(bar, true);
+        } else {
+          this.clearBarAutoHideTimer(bar);
+          this.setBarAutoHideVisible(bar, false);
+        }
       }
     };
     this.barAutoHideWindowBlurHandler = () => {
@@ -2448,14 +2488,17 @@ class CompositionModePlugin extends Plugin {
     this.barAutoHideWindowBlurHandler = null;
     this.barAutoHideLastPointer = null;
     this.barAutoHidePointerLock = null;
+    this.barAutoHideToolbarPopupArmed = false;
+    this.barAutoHideToolbarPopupBaseline = null;
+    this.barAutoHideToolbarPopoverWasOpen = false;
     this.barAutoHideToolbarVisible = null;
     this.barAutoHideStatusVisible = null;
-    this.editingToolbarStrip?.classList.remove('composition-mode-bar-hidden');
+    this.editingToolbarBand?.classList.remove('composition-mode-bar-hidden');
     this.controlBar?.classList.remove('composition-mode-bar-hidden');
   }
 
   getBarForEventTarget(target) {
-    if (this.editingToolbarStrip?.contains(target)) return 'toolbar';
+    if (this.editingToolbarBand?.contains(target)) return 'toolbar';
     if (this.controlBar?.contains(target)) return 'status';
     return null;
   }
@@ -2475,6 +2518,7 @@ class CompositionModePlugin extends Plugin {
 
   isBarAutoHideProtected(bar) {
     if (this.barAutoHidePointerLock === bar) return true;
+    if (bar === 'toolbar' && this.isEditingToolbarPopoverOpen()) return true;
     if (bar === 'status' && this.statusPopover && !this.statusPopover.hidden) return true;
     const pointerTarget = this.barAutoHideLastPointer?.target;
     return this.getBarForEventTarget(pointerTarget) === bar ||
@@ -2482,9 +2526,56 @@ class CompositionModePlugin extends Plugin {
       this.isPointerInBarRevealZone(bar);
   }
 
+  isEditingToolbarPopoverOpen() {
+    const band = this.editingToolbarBand;
+    if (!band?.isConnected) return false;
+    if (band.querySelector('[aria-expanded="true"]')) {
+      this.barAutoHideToolbarPopoverWasOpen = true;
+      return true;
+    }
+
+    const hostDocument = band.ownerDocument;
+    try {
+      const triggers = [...band.querySelectorAll('[popovertarget]')];
+      for (const popover of hostDocument.querySelectorAll(':popover-open')) {
+        if (band.contains(popover) || triggers.some(trigger =>
+          trigger.getAttribute('popovertarget') === popover.id)) {
+          this.barAutoHideToolbarPopoverWasOpen = true;
+          return true;
+        }
+      }
+    } catch (_) {
+      // Older Electron versions do not support the Popover API selector.
+    }
+
+    // Obsidian menus are generally portalled to body. Remember that the
+    // interaction began in the strip, then protect the band only while one of
+    // those portal surfaces remains rendered.
+    if (!this.barAutoHideToolbarPopupArmed) {
+      this.barAutoHideToolbarPopoverWasOpen = false;
+      return false;
+    }
+    const baseline = this.barAutoHideToolbarPopupBaseline;
+    const popup = this.getVisibleToolbarPortalPopups(hostDocument)
+      .find(element => !baseline?.has(element));
+    if (popup) {
+      this.barAutoHideToolbarPopoverWasOpen = true;
+      return true;
+    }
+    this.barAutoHideToolbarPopupArmed = false;
+    this.barAutoHideToolbarPopupBaseline = null;
+    this.barAutoHideToolbarPopoverWasOpen = false;
+    return false;
+  }
+
+  getVisibleToolbarPortalPopups(hostDocument) {
+    return [...hostDocument.querySelectorAll('.menu, .popover, .suggestion-container')]
+      .filter(element => !element.hidden && element.getClientRects().length > 0);
+  }
+
   isPointerOverBar(bar) {
     const pointer = this.barAutoHideLastPointer;
-    const element = bar === 'toolbar' ? this.editingToolbarStrip : this.controlBar;
+    const element = bar === 'toolbar' ? this.editingToolbarBand : this.controlBar;
     if (!pointer || !element?.isConnected) return false;
     const rect = element.getBoundingClientRect();
     return pointer.x >= rect.left && pointer.x <= rect.right &&
@@ -2504,7 +2595,7 @@ class CompositionModePlugin extends Plugin {
   }
 
   setBarAutoHideVisible(bar, visible) {
-    const element = bar === 'toolbar' ? this.editingToolbarStrip : this.controlBar;
+    const element = bar === 'toolbar' ? this.editingToolbarBand : this.controlBar;
     if (bar === 'status' && this.settings.showStatusBar === false) visible = false;
     if (bar === 'toolbar') this.barAutoHideToolbarVisible = visible;
     else this.barAutoHideStatusVisible = visible;
@@ -2512,7 +2603,10 @@ class CompositionModePlugin extends Plugin {
   }
 
   scheduleBarAutoHide(bar) {
-    if (!this.isActive || this.barAutoHidePointerLock === bar) return;
+    if (!this.isActive || this.isBarAutoHideProtected(bar)) {
+      this.clearBarAutoHideTimer(bar);
+      return;
+    }
     if (bar === 'status' && this.settings.showStatusBar === false) return;
     this.clearBarAutoHideTimer(bar);
     const timerName = bar === 'toolbar'

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0 — 2026-07-31
+
+Word-like editor chrome. All bars now conform to the editor pane instead of spanning the window.
+
+- **Word-style status bar**: thin, theme-aware strip with page indicator ("Page 3 of 22"), word count, zoom, type size, paper size, margins, background, and a settings popover — confined to the editor pane so sidebars stay visible.
+- **Editing Toolbar integration**: when the [Editing Toolbar](https://github.com/PKM-er/obsidian-editing-toolbar) plugin is present, its strip is adopted into a chrome band docked flush to the pane top — on macOS the band contains the window traffic lights like a native title bar (except in fullscreen).
+- **Auto-hide chrome**: toolbar and status bar fade after 1.5s of pointer idle and return when the mouse reaches the pane's top or bottom edge; they stay pinned while hovered, during slider drags, and while popovers are open. The page never shifts when chrome comes and goes.
+- **Overlay scrollbar**: a slim draggable scrollbar at the right edge of the pane — zero layout impact, page-by-page track clicks, idle fade, hidden when the note fits on screen.
+- Fixed composition-mode chrome overlapping the macOS traffic lights when the sidebar is collapsed.
+
 ## 1.1.6 — 2026-07-16
 
 - Added `Mod` + `Shift` + `C` as the default shortcut for toggling Composition Mode.
