@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.1 — 2026-07-31
+
+Compatibility fixes for Obsidian 1.11+.
+
+- Fixed a white strip visually joining pages at their right edge on systems with "always show scroll bars" (classic scrollbars). Obsidian 1.11's newer Chromium ignores legacy `::-webkit-scrollbar` sizing; scrollbars are now also hidden via the standard `scrollbar-width` property.
+- Fixed debug logging silently failing on Obsidian 1.11+, which removed the deprecated global `app` handle.
+
 ## 1.2.0 — 2026-07-31
 
 Word-like editor chrome. All bars now conform to the editor pane instead of spanning the window.

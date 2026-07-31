@@ -600,6 +600,16 @@ body.composition-mode-active ::-webkit-scrollbar {
   height: 0;
 }
 
+/* Obsidian 1.11+ ships a Chromium that honors the standard scrollbar-width
+   property and then ignores ::-webkit-scrollbar sizing entirely. Without
+   this, a classic 16px gutter returns on "always show scroll bars" systems:
+   the paper background paints under the gutter while page-gap bars are
+   clipped at its edge, leaving a white channel joining pages on the right. */
+body.composition-mode-active,
+body.composition-mode-active * {
+  scrollbar-width: none;
+}
+
 .composition-mode-overlay-scrollbar {
   position: fixed;
   z-index: 9997;

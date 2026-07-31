@@ -124,16 +124,20 @@ let statusDocChangeScheduler = null;
 let overlayScrollbarUpdateScheduler = null;
 
 // Single-line-per-rebuild debug log. Spam-proof: no tight-loop writes.
+// Obsidian 1.11 removed the global `app`; the plugin registers its App
+// instance here in onload so module-level helpers can reach the vault.
+let pluginApp = null;
+
 async function dbg(msg) {
-  if (!DEBUG_MODE_ENABLED) return;
+  if (!DEBUG_MODE_ENABLED || !pluginApp) return;
   try {
     const path = 'working/composition-mode-page-break-debug.md';
     const timestamp = new Date().toISOString();
     const line = `- ${timestamp} ${msg}\n`;
-    if (!(await app.vault.adapter.exists(path))) {
-      await app.vault.create(path, '# Composition Mode Debug Log\n\n');
+    if (!(await pluginApp.vault.adapter.exists(path))) {
+      await pluginApp.vault.create(path, '# Composition Mode Debug Log\n\n');
     }
-    await app.vault.adapter.append(path, line);
+    await pluginApp.vault.adapter.append(path, line);
   } catch (e) {
     console.error('Composition Mode Debug Error:', e);
   }
@@ -1298,6 +1302,7 @@ const pageBreakField = StateField.define({
 
 class CompositionModePlugin extends Plugin {
   async onload() {
+    pluginApp = this.app;
     await this.loadSettings();
 
     this.isActive = false;
