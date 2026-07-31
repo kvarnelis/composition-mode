@@ -33,11 +33,11 @@ body.composition-mode-active .mod-root {
 /* Editing Toolbar's workspace append target is the root split, whose direct
    children are horizontal columns. Composition Mode instead owns this fixed
    strip outside all workspace flex layout. JS pins it to the active markdown
-   leaf, whose top padding reserves the measured height without moving either
-   sidebar. */
+   leaf, whose top padding reserves the measured height plus any macOS titlebar
+   clearance without moving either sidebar. */
 .composition-mode-toolbar-strip {
   position: fixed;
-  top: 0;
+  top: var(--composition-mode-toolbar-clearance, 0px);
   right: auto;
   left: 0;
   width: 0;
@@ -51,11 +51,16 @@ body.composition-mode-active .mod-root {
   pointer-events: auto;
   overflow-x: auto;
   overscroll-behavior-x: contain;
+  opacity: 1;
+  transition: opacity 150ms ease;
 }
 
 body.composition-mode-active.composition-mode-toolbar-strip-visible
   .workspace-leaf.composition-mode-editor-pane {
-  padding-top: var(--composition-mode-toolbar-strip-height, 0px);
+  padding-top: calc(
+    var(--composition-mode-toolbar-strip-height, 0px) +
+    var(--composition-mode-toolbar-clearance, 0px)
+  );
   box-sizing: border-box;
 }
 
@@ -312,18 +317,34 @@ body.composition-mode-active .modal-container {
   color: var(--text-muted);
   overflow: visible;
   box-shadow: 0 -1px 2px rgb(0 0 0 / 4%);
+  opacity: 1;
+  transition: opacity 150ms ease;
 }
 
-/* Compatibility with the pre-WIP reveal target. If a future status-bar
-   variant reinstates it, it follows the same JS-measured editor bounds. */
-.composition-mode-hover-zone {
+.composition-mode-toolbar-strip.composition-mode-bar-hidden,
+.composition-mode-control-bar.composition-mode-bar-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Pointer movement is tracked at the document level so these generous edge
+   bands never intercept editor clicks, selections, or scrollbar drags. */
+.composition-mode-reveal-zone {
   position: fixed;
   right: auto;
-  bottom: 0;
   left: 0;
   width: 0;
-  height: 10px;
+  height: 40px;
   z-index: 9998;
+  pointer-events: none;
+}
+
+.composition-mode-reveal-zone-top {
+  top: 0;
+}
+
+.composition-mode-reveal-zone-bottom {
+  bottom: 0;
 }
 
 .composition-mode-status-left,
@@ -560,18 +581,49 @@ body.composition-mode-active .modal-container {
 
 
 /* ===== Scrollbar =====
-   Hidden in composition mode. The scrollbar previously took 6px of
-   layout on the right edge of .cm-scroller, which caused the page-gap
-   bar (bleeding to the scroller's content-box edge via negative margins)
-   to fall 6px short of the paper's visible right edge — a thin but
-   noticeable sliver of white between bar and paper. With the scrollbar
-   hidden, clientWidth equals offsetWidth, and the bar's negative-margin
-   bleed reaches flush with the paper edge. Trackpad scrolling still
-   works; keyboard (page up/down, arrow keys) still works. This matches
-   the distraction-free writing aesthetic composition mode is designed for. */
+   Keep the CM6 scrollbar at zero width so it has no effect on the paper or
+   page-gap geometry. The visible scrollbar is a fixed document-level overlay
+   owned by the plugin and pinned to the active editor pane by JS. */
 body.composition-mode-active ::-webkit-scrollbar {
   width: 0;
   height: 0;
+}
+
+.composition-mode-overlay-scrollbar {
+  position: fixed;
+  z-index: 9997;
+  box-sizing: border-box;
+  padding: 0 4px;
+  cursor: default;
+  touch-action: none;
+  opacity: 0.3;
+  transition: opacity 180ms ease;
+}
+
+.composition-mode-overlay-scrollbar[hidden] {
+  display: none;
+}
+
+.composition-mode-overlay-scrollbar.is-active,
+.composition-mode-overlay-scrollbar:hover,
+.composition-mode-overlay-scrollbar.is-dragging {
+  opacity: 1;
+}
+
+.composition-mode-overlay-scrollbar-thumb {
+  width: 8px;
+  min-height: 32px;
+  border-radius: 999px;
+  background: var(--text-faint);
+  box-shadow: 0 0 0 1px var(--background-modifier-border);
+  cursor: ns-resize;
+  transition: background-color 120ms ease;
+}
+
+.composition-mode-overlay-scrollbar.is-active .composition-mode-overlay-scrollbar-thumb,
+.composition-mode-overlay-scrollbar:hover .composition-mode-overlay-scrollbar-thumb,
+.composition-mode-overlay-scrollbar.is-dragging .composition-mode-overlay-scrollbar-thumb {
+  background: var(--text-muted);
 }
 
 

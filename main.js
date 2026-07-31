@@ -1,4 +1,4 @@
-const { Plugin, PluginSettingTab, Setting, MarkdownView, Scope } = require('obsidian');
+const { Plugin, PluginSettingTab, Setting, MarkdownView, Scope, Platform } = require('obsidian');
 const { StateField, StateEffect } = require('@codemirror/state');
 const { Decoration, WidgetType, EditorView } = require('@codemirror/view');
 
@@ -25,6 +25,13 @@ const MIN_VISUAL_ZOOM = 0.25;
 const MAX_VISUAL_ZOOM = 2;
 const MIN_FONT_SIZE_PT = 8;
 const MAX_FONT_SIZE_PT = 24;
+const BAR_AUTO_HIDE_DELAY_MS = 1500;
+const BAR_REVEAL_ZONE_HEIGHT_PX = 40;
+const OVERLAY_SCROLLBAR_IDLE_DELAY_MS = 1000;
+const OVERLAY_SCROLLBAR_TRACK_WIDTH_PX = 16;
+const OVERLAY_SCROLLBAR_MIN_THUMB_PX = 32;
+// Matches Obsidian's own `--titlebar-height` fallback for its frameless window.
+const MACOS_TITLEBAR_HEIGHT = 30;
 
 const PAPER_SIZES = {
   trade6x9: { label: 'Trade 6 × 9', width: 6, height: 9 },
@@ -114,6 +121,7 @@ let zeroMetricRetryScheduler = null;
 let zeroMetricRetrySucceeded = null;
 let paginationStatusScheduler = null;
 let statusDocChangeScheduler = null;
+let overlayScrollbarUpdateScheduler = null;
 
 // Single-line-per-rebuild debug log. Spam-proof: no tight-loop writes.
 async function dbg(msg) {
@@ -1338,6 +1346,7 @@ class CompositionModePlugin extends Plugin {
     zeroMetricRetrySucceeded = () => this.resetZeroMetricRetries();
     paginationStatusScheduler = () => this.scheduleStatusPageUpdate();
     statusDocChangeScheduler = () => this.scheduleStatusWordCountUpdate();
+    overlayScrollbarUpdateScheduler = () => this.scheduleOverlayScrollbarUpdate();
 
     // Visual debug overlay flag. Keep the machinery available for future
     // debugging, but default it OFF now that full-width page-break rendering
@@ -1438,7 +1447,10 @@ class CompositionModePlugin extends Plugin {
         return v || Decoration.none;
       }),
       EditorView.updateListener.of(update => {
-        if (update.docChanged) statusDocChangeScheduler?.();
+        if (update.docChanged) {
+          statusDocChangeScheduler?.();
+          overlayScrollbarUpdateScheduler?.();
+        }
       })
     ]);
 
@@ -1460,6 +1472,7 @@ class CompositionModePlugin extends Plugin {
     zeroMetricRetrySucceeded = null;
     paginationStatusScheduler = null;
     statusDocChangeScheduler = null;
+    overlayScrollbarUpdateScheduler = null;
     this.resetZeroMetricRetries();
     if (this.isActive) this.deactivate();
   }
@@ -1703,6 +1716,8 @@ class CompositionModePlugin extends Plugin {
     this.createBackdrop();
     this.injectStyleEl();
     this.applyStatusBarVisibility();
+    this.setupBarAutoHide();
+    this.setupOverlayScrollbar();
     this.setupZoomHandlers();
     this.setupResizeHandler();
     this.applyStyles();
@@ -1726,6 +1741,8 @@ class CompositionModePlugin extends Plugin {
     // before restoring the third-party hosts or our own restoration mutations
     // would immediately move them back into the workspace strip.
     this.stopEditingToolbarHostBridge();
+    this.teardownBarAutoHide();
+    this.teardownOverlayScrollbar();
 
     document.body.classList.remove('composition-mode-active');
     document.body.classList.remove('composition-debug-overlay');
@@ -1893,8 +1910,74 @@ class CompositionModePlugin extends Plugin {
       this.editingToolbarStripResizeObserver.observe(strip);
     }
     hostDocument.body?.classList.add('composition-mode-toolbar-strip-visible');
+    this.startEditingToolbarFullscreenTracking(hostDocument);
+    this.updateEditingToolbarClearance();
     this.updateEditorPaneBounds();
+    this.refreshBarAutoHideForPointer();
     return strip;
+  }
+
+  startEditingToolbarFullscreenTracking(hostDocument) {
+    this.stopEditingToolbarFullscreenTracking();
+    this.editingToolbarFullscreenDocument = hostDocument;
+    this.editingToolbarFullscreenHandler = () => {
+      if (!this.isActive) return;
+      this.updateEditingToolbarClearance();
+      this.scheduleEditorPaneBoundsUpdate();
+    };
+    hostDocument.addEventListener('fullscreenchange', this.editingToolbarFullscreenHandler);
+
+    // Electron's native fullscreen does not use the DOM Fullscreen API.
+    // Obsidian marks that state with body.is-fullscreen instead.
+    const MutationObserverCtor = hostDocument.defaultView?.MutationObserver;
+    if (hostDocument.body && MutationObserverCtor) {
+      this.editingToolbarFullscreenObserver = new MutationObserverCtor(
+        this.editingToolbarFullscreenHandler
+      );
+      this.editingToolbarFullscreenObserver.observe(hostDocument.body, {
+        attributes: true,
+        attributeFilter: ['class']
+      });
+    }
+  }
+
+  stopEditingToolbarFullscreenTracking() {
+    if (this.editingToolbarFullscreenDocument && this.editingToolbarFullscreenHandler) {
+      this.editingToolbarFullscreenDocument.removeEventListener(
+        'fullscreenchange',
+        this.editingToolbarFullscreenHandler
+      );
+    }
+    this.editingToolbarFullscreenObserver?.disconnect();
+    this.editingToolbarFullscreenObserver = null;
+    this.editingToolbarFullscreenDocument = null;
+    this.editingToolbarFullscreenHandler = null;
+  }
+
+  updateEditingToolbarClearance() {
+    const strip = this.editingToolbarStrip;
+    if (!strip?.isConnected) return;
+    const hostDocument = strip.ownerDocument;
+    const isFullscreen =
+      !!hostDocument.fullscreenElement ||
+      hostDocument.body?.classList.contains('is-fullscreen');
+    let clearance = 0;
+    if (Platform.isMacOS && !isFullscreen) {
+      const titlebarHeight = parseFloat(
+        hostDocument.defaultView?.getComputedStyle(hostDocument.body)
+          .getPropertyValue('--titlebar-height')
+      );
+      clearance = Number.isFinite(titlebarHeight) && titlebarHeight > 0
+        ? Math.ceil(titlebarHeight)
+        : MACOS_TITLEBAR_HEIGHT;
+    }
+    if (clearance === this.editingToolbarClearance) return;
+    this.editingToolbarClearance = clearance;
+    hostDocument.documentElement.style.setProperty(
+      '--composition-mode-toolbar-clearance',
+      `${clearance}px`
+    );
+    this.scheduleStatusPageUpdate();
   }
 
   measureEditingToolbarStrip() {
@@ -1921,12 +2004,20 @@ class CompositionModePlugin extends Plugin {
     this.editingToolbarStripResizeObserver = null;
 
     const strip = this.editingToolbarStrip;
-    const hostDocument = strip?.ownerDocument || document;
+    const hostDocument =
+      strip?.ownerDocument ||
+      this.editingToolbarFullscreenDocument ||
+      document;
+    this.stopEditingToolbarFullscreenTracking();
     if (strip) strip.remove();
     this.editingToolbarStrip = null;
     this.editingToolbarStripHeight = 0;
+    this.editingToolbarClearance = 0;
+    this.clearBarAutoHideTimer('toolbar');
+    if (this.barAutoHidePointerLock === 'toolbar') this.barAutoHidePointerLock = null;
     hostDocument.body?.classList.remove('composition-mode-toolbar-strip-visible');
     hostDocument.documentElement?.style.removeProperty('--composition-mode-toolbar-strip-height');
+    hostDocument.documentElement?.style.removeProperty('--composition-mode-toolbar-clearance');
   }
 
   getActiveMarkdownLeafElement() {
@@ -1941,7 +2032,9 @@ class CompositionModePlugin extends Plugin {
     const targets = [
       this.editingToolbarStrip,
       this.controlBar,
-      this.hoverZone
+      this.barAutoHideTopZone,
+      this.barAutoHideBottomZone,
+      this.overlayScrollbar
     ].filter(Boolean);
 
     if (leaf !== this.editorPaneBoundsLeaf) {
@@ -1976,6 +2069,20 @@ class CompositionModePlugin extends Plugin {
       target.style.width = `${rect.width}px`;
       target.style.visibility = '';
     }
+    if (this.barAutoHideTopZone) {
+      this.barAutoHideTopZone.style.top = `${rect.top}px`;
+    }
+    if (this.barAutoHideBottomZone) {
+      const hostHeight = leaf.ownerDocument?.defaultView?.innerHeight || window.innerHeight;
+      this.barAutoHideBottomZone.style.bottom = `${Math.max(0, hostHeight - rect.bottom)}px`;
+    }
+    if (this.overlayScrollbar) {
+      this.overlayScrollbar.style.left = `${rect.right - OVERLAY_SCROLLBAR_TRACK_WIDTH_PX}px`;
+      this.overlayScrollbar.style.width = `${OVERLAY_SCROLLBAR_TRACK_WIDTH_PX}px`;
+      this.overlayScrollbar.style.top = `${rect.top}px`;
+      this.overlayScrollbar.style.height = `${rect.height}px`;
+      this.updateOverlayScrollbar();
+    }
   }
 
   scheduleEditorPaneBoundsUpdate() {
@@ -1990,6 +2097,7 @@ class CompositionModePlugin extends Plugin {
       this.updateEditorPaneBounds();
       this.measureEditingToolbarStrip();
       this.scheduleStatusPageUpdate();
+      this.scheduleOverlayScrollbarUpdate();
     });
   }
 
@@ -2005,6 +2113,424 @@ class CompositionModePlugin extends Plugin {
       this.editorPaneBoundsFrame = null;
       this.editorPaneBoundsFrameWindow = null;
     }
+  }
+
+  setupOverlayScrollbar() {
+    this.teardownOverlayScrollbar();
+
+    const track = document.createElement('div');
+    track.className = 'composition-mode-overlay-scrollbar';
+    track.setAttribute('aria-hidden', 'true');
+    track.hidden = true;
+    const thumb = document.createElement('div');
+    thumb.className = 'composition-mode-overlay-scrollbar-thumb';
+    track.appendChild(thumb);
+    document.body.appendChild(track);
+    this.overlayScrollbar = track;
+    this.overlayScrollbarThumb = thumb;
+
+    this.overlayScrollbarScrollHandler = () => {
+      this.scheduleOverlayScrollbarUpdate();
+      this.revealOverlayScrollbar();
+    };
+    this.overlayScrollbarPointerEnterHandler = () => {
+      this.overlayScrollbarHovered = true;
+      this.revealOverlayScrollbar(false);
+    };
+    this.overlayScrollbarPointerLeaveHandler = () => {
+      this.overlayScrollbarHovered = false;
+      if (!this.overlayScrollbarDrag) this.scheduleOverlayScrollbarFade();
+    };
+    this.overlayScrollbarTrackPointerDownHandler = event => {
+      if (event.button !== 0 || event.target === thumb || track.hidden) return;
+      const scroller = this.overlayScrollbarScroller;
+      if (!scroller) return;
+      event.preventDefault();
+      const thumbRect = thumb.getBoundingClientRect();
+      const direction = event.clientY < thumbRect.top ? -1 : 1;
+      scroller.scrollTop += direction * Math.max(1, scroller.clientHeight * 0.9);
+      this.revealOverlayScrollbar();
+    };
+    this.overlayScrollbarThumbPointerDownHandler = event => {
+      if (event.button !== 0 || track.hidden) return;
+      event.preventDefault();
+      event.stopPropagation();
+      this.overlayScrollbarDrag = {
+        pointerId: event.pointerId,
+        startClientY: event.clientY,
+        startScrollTop: this.overlayScrollbarScroller?.scrollTop || 0
+      };
+      thumb.setPointerCapture(event.pointerId);
+      track.classList.add('is-dragging');
+      this.revealOverlayScrollbar(false);
+    };
+    this.overlayScrollbarThumbPointerMoveHandler = event => {
+      const drag = this.overlayScrollbarDrag;
+      const scroller = this.overlayScrollbarScroller;
+      if (!drag || drag.pointerId !== event.pointerId || !scroller) return;
+      const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      const availableTrack = Math.max(1, track.clientHeight - thumb.offsetHeight);
+      // clientY and availableTrack are both native-scale visual pixels, while
+      // maxScroll and scrollTop are both zoom-independent layout pixels. Their
+      // ratios map directly, including at non-100% CSS zoom.
+      scroller.scrollTop = drag.startScrollTop +
+        ((event.clientY - drag.startClientY) * maxScroll / availableTrack);
+    };
+    this.overlayScrollbarThumbPointerUpHandler = event => {
+      if (this.overlayScrollbarDrag?.pointerId !== event.pointerId) return;
+      this.overlayScrollbarDrag = null;
+      track.classList.remove('is-dragging');
+      if (thumb.hasPointerCapture(event.pointerId)) thumb.releasePointerCapture(event.pointerId);
+      if (!this.overlayScrollbarHovered) this.scheduleOverlayScrollbarFade();
+    };
+
+    track.addEventListener('pointerenter', this.overlayScrollbarPointerEnterHandler);
+    track.addEventListener('pointerleave', this.overlayScrollbarPointerLeaveHandler);
+    track.addEventListener('pointerdown', this.overlayScrollbarTrackPointerDownHandler);
+    thumb.addEventListener('pointerdown', this.overlayScrollbarThumbPointerDownHandler);
+    thumb.addEventListener('pointermove', this.overlayScrollbarThumbPointerMoveHandler);
+    thumb.addEventListener('pointerup', this.overlayScrollbarThumbPointerUpHandler);
+    thumb.addEventListener('pointercancel', this.overlayScrollbarThumbPointerUpHandler);
+    thumb.addEventListener('lostpointercapture', this.overlayScrollbarThumbPointerUpHandler);
+
+    const ResizeObserverCtor = document.defaultView?.ResizeObserver;
+    if (ResizeObserverCtor) {
+      this.overlayScrollbarResizeObserver = new ResizeObserverCtor(() => {
+        this.scheduleOverlayScrollbarUpdate();
+      });
+    }
+    this.updateEditorPaneBounds();
+  }
+
+  bindOverlayScrollbarScroller(scroller) {
+    if (scroller === this.overlayScrollbarScroller) return;
+    this.overlayScrollbarScroller?.removeEventListener(
+      'scroll',
+      this.overlayScrollbarScrollHandler
+    );
+    this.overlayScrollbarResizeObserver?.disconnect();
+    this.overlayScrollbarScroller = scroller?.isConnected ? scroller : null;
+    if (!this.overlayScrollbarScroller) return;
+
+    this.overlayScrollbarScroller.addEventListener(
+      'scroll',
+      this.overlayScrollbarScrollHandler,
+      { passive: true }
+    );
+    this.overlayScrollbarResizeObserver?.observe(this.overlayScrollbarScroller);
+    const sizer = this.overlayScrollbarScroller.querySelector('.cm-sizer');
+    if (sizer) this.overlayScrollbarResizeObserver?.observe(sizer);
+  }
+
+  updateOverlayScrollbar() {
+    const track = this.overlayScrollbar;
+    const thumb = this.overlayScrollbarThumb;
+    if (!this.isActive || !track || !thumb) return;
+
+    const { scroller } = this.getActiveCompositionElements();
+    this.bindOverlayScrollbarScroller(scroller);
+    const activeScroller = this.overlayScrollbarScroller;
+    const trackHeight = track.clientHeight;
+    if (!activeScroller || trackHeight <= 0) {
+      track.hidden = true;
+      return;
+    }
+
+    const scrollHeight = activeScroller.scrollHeight;
+    const clientHeight = activeScroller.clientHeight;
+    const maxScroll = Math.max(0, scrollHeight - clientHeight);
+    if (maxScroll <= 1 || scrollHeight <= 0) {
+      track.hidden = true;
+      return;
+    }
+
+    track.hidden = false;
+    const thumbHeight = Math.min(
+      trackHeight,
+      Math.max(OVERLAY_SCROLLBAR_MIN_THUMB_PX, trackHeight * clientHeight / scrollHeight)
+    );
+    const availableTrack = Math.max(0, trackHeight - thumbHeight);
+    const thumbTop = availableTrack * activeScroller.scrollTop / maxScroll;
+    thumb.style.height = `${thumbHeight}px`;
+    thumb.style.transform = `translateY(${Math.max(0, Math.min(availableTrack, thumbTop))}px)`;
+  }
+
+  scheduleOverlayScrollbarUpdate() {
+    if (!this.isActive || !this.overlayScrollbar || this.overlayScrollbarFrame) return;
+    this.overlayScrollbarFrame = requestAnimationFrame(() => {
+      this.overlayScrollbarFrame = null;
+      this.updateOverlayScrollbar();
+    });
+  }
+
+  revealOverlayScrollbar(scheduleFade = true) {
+    if (!this.overlayScrollbar || this.overlayScrollbar.hidden) return;
+    if (this.overlayScrollbarFadeTimer) {
+      clearTimeout(this.overlayScrollbarFadeTimer);
+      this.overlayScrollbarFadeTimer = null;
+    }
+    this.overlayScrollbar.classList.add('is-active');
+    if (scheduleFade && !this.overlayScrollbarHovered && !this.overlayScrollbarDrag) {
+      this.scheduleOverlayScrollbarFade();
+    }
+  }
+
+  scheduleOverlayScrollbarFade() {
+    if (!this.overlayScrollbar || this.overlayScrollbarHovered || this.overlayScrollbarDrag) return;
+    if (this.overlayScrollbarFadeTimer) clearTimeout(this.overlayScrollbarFadeTimer);
+    this.overlayScrollbarFadeTimer = setTimeout(() => {
+      this.overlayScrollbarFadeTimer = null;
+      this.overlayScrollbar?.classList.remove('is-active');
+    }, OVERLAY_SCROLLBAR_IDLE_DELAY_MS);
+  }
+
+  teardownOverlayScrollbar() {
+    if (this.overlayScrollbarFrame) {
+      cancelAnimationFrame(this.overlayScrollbarFrame);
+      this.overlayScrollbarFrame = null;
+    }
+    if (this.overlayScrollbarFadeTimer) {
+      clearTimeout(this.overlayScrollbarFadeTimer);
+      this.overlayScrollbarFadeTimer = null;
+    }
+    this.overlayScrollbarScroller?.removeEventListener(
+      'scroll',
+      this.overlayScrollbarScrollHandler
+    );
+    this.overlayScrollbarResizeObserver?.disconnect();
+    this.overlayScrollbarResizeObserver = null;
+    this.overlayScrollbar?.removeEventListener(
+      'pointerenter',
+      this.overlayScrollbarPointerEnterHandler
+    );
+    this.overlayScrollbar?.removeEventListener(
+      'pointerleave',
+      this.overlayScrollbarPointerLeaveHandler
+    );
+    this.overlayScrollbar?.removeEventListener(
+      'pointerdown',
+      this.overlayScrollbarTrackPointerDownHandler
+    );
+    this.overlayScrollbarThumb?.removeEventListener(
+      'pointerdown',
+      this.overlayScrollbarThumbPointerDownHandler
+    );
+    this.overlayScrollbarThumb?.removeEventListener(
+      'pointermove',
+      this.overlayScrollbarThumbPointerMoveHandler
+    );
+    this.overlayScrollbarThumb?.removeEventListener(
+      'pointerup',
+      this.overlayScrollbarThumbPointerUpHandler
+    );
+    this.overlayScrollbarThumb?.removeEventListener(
+      'pointercancel',
+      this.overlayScrollbarThumbPointerUpHandler
+    );
+    this.overlayScrollbarThumb?.removeEventListener(
+      'lostpointercapture',
+      this.overlayScrollbarThumbPointerUpHandler
+    );
+    this.overlayScrollbar?.remove();
+    this.overlayScrollbar = null;
+    this.overlayScrollbarThumb = null;
+    this.overlayScrollbarScroller = null;
+    this.overlayScrollbarScrollHandler = null;
+    this.overlayScrollbarPointerEnterHandler = null;
+    this.overlayScrollbarPointerLeaveHandler = null;
+    this.overlayScrollbarTrackPointerDownHandler = null;
+    this.overlayScrollbarThumbPointerDownHandler = null;
+    this.overlayScrollbarThumbPointerMoveHandler = null;
+    this.overlayScrollbarThumbPointerUpHandler = null;
+    this.overlayScrollbarHovered = false;
+    this.overlayScrollbarDrag = null;
+  }
+
+  setupBarAutoHide() {
+    this.teardownBarAutoHide();
+
+    this.barAutoHideTopZone = document.createElement('div');
+    this.barAutoHideTopZone.className = 'composition-mode-reveal-zone composition-mode-reveal-zone-top';
+    this.barAutoHideTopZone.setAttribute('aria-hidden', 'true');
+    this.barAutoHideTopZone.style.height = `${BAR_REVEAL_ZONE_HEIGHT_PX}px`;
+    this.barAutoHideBottomZone = document.createElement('div');
+    this.barAutoHideBottomZone.className = 'composition-mode-reveal-zone composition-mode-reveal-zone-bottom';
+    this.barAutoHideBottomZone.setAttribute('aria-hidden', 'true');
+    this.barAutoHideBottomZone.style.height = `${BAR_REVEAL_ZONE_HEIGHT_PX}px`;
+    document.body.append(this.barAutoHideTopZone, this.barAutoHideBottomZone);
+
+    this.barAutoHideLastPointer = null;
+    this.barAutoHidePointerLock = null;
+    this.barAutoHideToolbarVisible = true;
+    this.barAutoHideStatusVisible = true;
+
+    this.barAutoHidePointerMoveHandler = (event) => {
+      this.barAutoHideLastPointer = {
+        x: event.clientX,
+        y: event.clientY,
+        target: event.target
+      };
+      this.refreshBarAutoHideForPointer();
+    };
+    this.barAutoHidePointerDownHandler = (event) => {
+      this.barAutoHideLastPointer = {
+        x: event.clientX,
+        y: event.clientY,
+        target: event.target
+      };
+      const bar = this.getBarForEventTarget(event.target);
+      if (!bar) {
+        this.refreshBarAutoHideForPointer();
+        return;
+      }
+      this.barAutoHidePointerLock = bar;
+      this.setBarAutoHideVisible(bar, true);
+      this.clearBarAutoHideTimer(bar);
+    };
+    this.barAutoHidePointerUpHandler = (event) => {
+      if (!this.barAutoHidePointerLock) return;
+      const eventDocument = event.target?.ownerDocument || document;
+      this.barAutoHideLastPointer = {
+        x: event.clientX,
+        y: event.clientY,
+        target: eventDocument.elementFromPoint?.(event.clientX, event.clientY) || event.target
+      };
+      this.barAutoHidePointerLock = null;
+      this.refreshBarAutoHideForPointer();
+    };
+    this.barAutoHideKeyDownHandler = (event) => {
+      if (!event.target?.closest?.('.cm-editor')) return;
+      this.clearBarAutoHideTimer('toolbar');
+      this.clearBarAutoHideTimer('status');
+      if (this.barAutoHidePointerLock !== 'toolbar') {
+        this.setBarAutoHideVisible('toolbar', false);
+      }
+      if (this.barAutoHidePointerLock !== 'status' &&
+          (!this.statusPopover || this.statusPopover.hidden)) {
+        this.setBarAutoHideVisible('status', false);
+      }
+    };
+    this.barAutoHideWindowBlurHandler = () => {
+      this.scheduleBarAutoHide('toolbar');
+      this.scheduleBarAutoHide('status');
+    };
+
+    document.addEventListener('pointermove', this.barAutoHidePointerMoveHandler, true);
+    document.addEventListener('pointerdown', this.barAutoHidePointerDownHandler, true);
+    document.addEventListener('pointerup', this.barAutoHidePointerUpHandler, true);
+    document.addEventListener('pointercancel', this.barAutoHidePointerUpHandler, true);
+    document.addEventListener('keydown', this.barAutoHideKeyDownHandler, true);
+    window.addEventListener('blur', this.barAutoHideWindowBlurHandler);
+    this.updateEditorPaneBounds();
+    this.scheduleBarAutoHide('toolbar');
+    this.scheduleBarAutoHide('status');
+  }
+
+  teardownBarAutoHide() {
+    this.clearBarAutoHideTimer('toolbar');
+    this.clearBarAutoHideTimer('status');
+    if (this.barAutoHidePointerMoveHandler) {
+      document.removeEventListener('pointermove', this.barAutoHidePointerMoveHandler, true);
+      document.removeEventListener('pointerdown', this.barAutoHidePointerDownHandler, true);
+      document.removeEventListener('pointerup', this.barAutoHidePointerUpHandler, true);
+      document.removeEventListener('pointercancel', this.barAutoHidePointerUpHandler, true);
+      document.removeEventListener('keydown', this.barAutoHideKeyDownHandler, true);
+      window.removeEventListener('blur', this.barAutoHideWindowBlurHandler);
+    }
+    this.barAutoHideTopZone?.remove();
+    this.barAutoHideBottomZone?.remove();
+    this.barAutoHideTopZone = null;
+    this.barAutoHideBottomZone = null;
+    this.barAutoHidePointerMoveHandler = null;
+    this.barAutoHidePointerDownHandler = null;
+    this.barAutoHidePointerUpHandler = null;
+    this.barAutoHideKeyDownHandler = null;
+    this.barAutoHideWindowBlurHandler = null;
+    this.barAutoHideLastPointer = null;
+    this.barAutoHidePointerLock = null;
+    this.barAutoHideToolbarVisible = null;
+    this.barAutoHideStatusVisible = null;
+    this.editingToolbarStrip?.classList.remove('composition-mode-bar-hidden');
+    this.controlBar?.classList.remove('composition-mode-bar-hidden');
+  }
+
+  getBarForEventTarget(target) {
+    if (this.editingToolbarStrip?.contains(target)) return 'toolbar';
+    if (this.controlBar?.contains(target)) return 'status';
+    return null;
+  }
+
+  isPointerInBarRevealZone(bar) {
+    const pointer = this.barAutoHideLastPointer;
+    const leaf = this.editorPaneBoundsLeaf || this.getActiveMarkdownLeafElement();
+    if (!pointer || !leaf?.isConnected) return false;
+    const rect = leaf.getBoundingClientRect();
+    if (pointer.x < rect.left || pointer.x > rect.right ||
+        pointer.y < rect.top || pointer.y > rect.bottom) return false;
+    if (bar === 'toolbar') {
+      return pointer.y <= rect.top + BAR_REVEAL_ZONE_HEIGHT_PX;
+    }
+    return pointer.y >= rect.bottom - BAR_REVEAL_ZONE_HEIGHT_PX;
+  }
+
+  isBarAutoHideProtected(bar) {
+    if (this.barAutoHidePointerLock === bar) return true;
+    if (bar === 'status' && this.statusPopover && !this.statusPopover.hidden) return true;
+    const pointerTarget = this.barAutoHideLastPointer?.target;
+    return this.getBarForEventTarget(pointerTarget) === bar ||
+      this.isPointerOverBar(bar) ||
+      this.isPointerInBarRevealZone(bar);
+  }
+
+  isPointerOverBar(bar) {
+    const pointer = this.barAutoHideLastPointer;
+    const element = bar === 'toolbar' ? this.editingToolbarStrip : this.controlBar;
+    if (!pointer || !element?.isConnected) return false;
+    const rect = element.getBoundingClientRect();
+    return pointer.x >= rect.left && pointer.x <= rect.right &&
+      pointer.y >= rect.top && pointer.y <= rect.bottom;
+  }
+
+  refreshBarAutoHideForPointer() {
+    if (!this.isActive || !this.barAutoHidePointerMoveHandler) return;
+    for (const bar of ['toolbar', 'status']) {
+      if (this.isBarAutoHideProtected(bar)) {
+        this.clearBarAutoHideTimer(bar);
+        this.setBarAutoHideVisible(bar, true);
+      } else {
+        this.scheduleBarAutoHide(bar);
+      }
+    }
+  }
+
+  setBarAutoHideVisible(bar, visible) {
+    const element = bar === 'toolbar' ? this.editingToolbarStrip : this.controlBar;
+    if (bar === 'status' && this.settings.showStatusBar === false) visible = false;
+    if (bar === 'toolbar') this.barAutoHideToolbarVisible = visible;
+    else this.barAutoHideStatusVisible = visible;
+    element?.classList.toggle('composition-mode-bar-hidden', !visible);
+  }
+
+  scheduleBarAutoHide(bar) {
+    if (!this.isActive || this.barAutoHidePointerLock === bar) return;
+    if (bar === 'status' && this.settings.showStatusBar === false) return;
+    this.clearBarAutoHideTimer(bar);
+    const timerName = bar === 'toolbar'
+      ? 'barAutoHideToolbarTimer'
+      : 'barAutoHideStatusTimer';
+    this[timerName] = setTimeout(() => {
+      this[timerName] = null;
+      if (!this.isBarAutoHideProtected(bar)) this.setBarAutoHideVisible(bar, false);
+    }, BAR_AUTO_HIDE_DELAY_MS);
+  }
+
+  clearBarAutoHideTimer(bar) {
+    const timerName = bar === 'toolbar'
+      ? 'barAutoHideToolbarTimer'
+      : 'barAutoHideStatusTimer';
+    if (!this[timerName]) return;
+    clearTimeout(this[timerName]);
+    this[timerName] = null;
   }
 
   createBackdrop() {
@@ -2361,6 +2887,8 @@ class CompositionModePlugin extends Plugin {
 
     this.updateZoomDisplay();
     this.updateTypeDisplay();
+    this.scheduleEditorPaneBoundsUpdate();
+    this.scheduleOverlayScrollbarUpdate();
 
     // Fast path: if only zoom changed, skip the full rebuild. CSS zoom is
     // pure magnification — page breaks are identical at every zoom level.
@@ -2839,6 +3367,7 @@ class CompositionModePlugin extends Plugin {
     if (this.settings.showStatusBar !== false) {
       if (!this.controlBar) this.createControlBar();
       this.setupStatusBarListeners();
+      this.refreshBarAutoHideForPointer();
     } else {
       this.destroyStatusBar();
     }
@@ -2852,6 +3381,8 @@ class CompositionModePlugin extends Plugin {
 
   destroyStatusBar() {
     this.teardownStatusBarListeners();
+    this.clearBarAutoHideTimer('status');
+    if (this.barAutoHidePointerLock === 'status') this.barAutoHidePointerLock = null;
     if (this.statusPopoverOutsideHandler) {
       document.removeEventListener('pointerdown', this.statusPopoverOutsideHandler, true);
       this.statusPopoverOutsideHandler = null;
@@ -3021,6 +3552,7 @@ class CompositionModePlugin extends Plugin {
     this.controlBar.append(left, right);
     document.body.appendChild(this.controlBar);
     this.updateEditorPaneBounds();
+    this.setBarAutoHideVisible('status', this.barAutoHideStatusVisible !== false);
 
     this.statusPopoverOutsideHandler = (event) => {
       if (!this.statusPopover || this.statusPopover.hidden) return;
@@ -3040,6 +3572,8 @@ class CompositionModePlugin extends Plugin {
     if (this.statusPopover.hidden) {
       this.statusPopover.hidden = false;
       this.statusPopoverTrigger.setAttribute('aria-expanded', 'true');
+      this.clearBarAutoHideTimer('status');
+      this.setBarAutoHideVisible('status', true);
     } else {
       this.closeStatusPopover();
     }
@@ -3049,6 +3583,7 @@ class CompositionModePlugin extends Plugin {
     if (!this.statusPopover) return;
     this.statusPopover.hidden = true;
     this.statusPopoverTrigger?.setAttribute('aria-expanded', 'false');
+    this.refreshBarAutoHideForPointer();
   }
 
   // --- Helpers ---
